@@ -230,3 +230,9 @@ pixi run -e julia julia --project=src/julia src/julia/iitm_server.jl --port 2700
 - `Mie` 与 `Julia` 的体场定义还不够严格
 - `Mie` 离线渲染链路仍然偏重
 - `README / GUI / 指标命名` 需要持续与代码同步
+
+## 仓库协作约定
+
+- 当前 GitHub 远端仓库用于保存当前代码基线与日常备份
+- 后续进行大规模代码修改、重构或高风险试验前，应先将本地稳定状态提交并推送到远端
+- 本地运行产物（如 `outputs/`、`temp/`、`log/`、`.pixi/`）不作为备份内容，远端只保留源码、配置、输入样例与必要依赖
