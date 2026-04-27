@@ -50,6 +50,8 @@ bundle = build_field_bundle(field, scatter, Dict{String,Any}(
 @assert bundle["effective_field_compute_mode"] == "both"
 @assert haskey(bundle["families"], "proxy")
 @assert haskey(bundle["families"], "exact")
+@assert 0.0 <= scatter["depol_back"] <= 1.0
+@assert 0.0 <= scatter["depol_forward"] <= 1.0
 
 catalog = build_field_catalog(bundle)
 @assert haskey(catalog, "proxy")
@@ -72,5 +74,26 @@ try
 finally
     rm(tmpdir; recursive=true, force=true)
 end
+
+mc_proxy = run_monte_carlo(scatter, Dict{String,Any}(
+    "beta_ext_surf" => 0.2,
+    "thickness_m" => 3.0,
+    "scale_height_m" => 0.0,
+    "n_photons" => 40,
+    "seed" => 20260428,
+    "collect_voxel_fields" => false,
+    "density_grid" => field["density_norm"],
+    "field_axis" => field["axis"],
+    "field_xy_centered" => true,
+    "density_sampling" => "nearest",
+))
+proxy_bundle = build_field_bundle(field, scatter, Dict{String,Any}(
+    "field_compute_mode" => "proxy_only",
+    "r_bottom" => 0.5,
+    "r_top" => 1.0,
+), mc_proxy)
+@assert proxy_bundle["effective_field_compute_mode"] == "proxy_only"
+@assert haskey(proxy_bundle["families"], "proxy")
+@assert !haskey(proxy_bundle["families"], "exact")
 
 println("julia_field_contract_ok")

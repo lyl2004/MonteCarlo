@@ -186,7 +186,7 @@ def safe_depol_ratio(m11: float, m12: float) -> float:
     ratio = float((m11 - m12) / denom)
     if not np.isfinite(ratio):
         return 0.0
-    return max(ratio, 0.0)
+    return min(max(ratio, 0.0), 1.0)
 
 
 def mie_scatter_observables(mie_res: MiePolarizedResult, forward_cone_deg: float = 2.0) -> dict:

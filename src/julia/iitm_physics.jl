@@ -291,7 +291,7 @@ function safe_depol_ratio(M11::Float64, M12::Float64)
     if !isfinite(ratio)
         return 0.0
     end
-    return max(ratio, 0.0)
+    return clamp(ratio, 0.0, 1.0)
 end
 
 function finalize_single_particle_result(T_matrix, lambda_um::Float64, shape_type::String,

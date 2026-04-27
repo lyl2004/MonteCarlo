@@ -238,7 +238,7 @@ FIELD_LABELS_BY_FAMILY = {
     },
 }
 
-MIE_FIELD_ORDER = ["beta_back", "beta_forward", "depol_ratio"]
+MIE_FIELD_ORDER = ["beta_back", "beta_forward", "depol_ratio", "density"]
 IITM_FIELD_ORDER = ["beta_back", "beta_forward", "depol_ratio", "density"]
 
 DEFAULT_BACKEND_FIELD_CATALOG = {
@@ -661,7 +661,7 @@ def _get_field_label(field_name: str) -> str:
 
 def _resolve_preview_filename(view_mode: str) -> str:
     base_name = view_mode if view_mode in VIEW_MODE_LABELS else "main"
-    if state.simulation_backend == "iitm":
+    if state.simulation_backend in ("iitm", "mie"):
         return f"render_{base_name}.html"
     field_name = state.current_iitm_field
     field_order = _get_backend_field_order()
@@ -702,7 +702,7 @@ def _get_available_view_files() -> dict[str, str]:
 
     view_files: dict[str, str] = {}
     for filename in artifacts:
-        if state.simulation_backend == "iitm":
+        if state.simulation_backend in ("iitm", "mie"):
             if filename not in {"render_main.html", "render_top.html", "render_front.html"}:
                 continue
         mode = _artifact_to_view_mode(filename)
@@ -711,7 +711,7 @@ def _get_available_view_files() -> dict[str, str]:
     return view_files
 
 
-def _build_iitm_preview_query() -> str:
+def _build_field_preview_query() -> str:
     params = {
         "t": f"{time.time()}",
         "embed": "1",
@@ -806,7 +806,7 @@ def refresh_preview(view_mode=None):
                     ).style(field_btn_style(field_name)).props('dense size=sm')
 
         if os.path.exists(file_path):
-            iframe_query = _build_iitm_preview_query() if state.simulation_backend == 'iitm' else f"t={time.time()}"
+            iframe_query = _build_field_preview_query() if state.simulation_backend in ('iitm', 'mie') else f"t={time.time()}"
             iframe_src = (f"/static_outputs/{reg['output_sub']}/{proj}"
                           f"/{target_filename}?{iframe_query}")
             ui.html(

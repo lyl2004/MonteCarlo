@@ -206,6 +206,7 @@ function build_configs(config::Dict)
         "thickness_m"    => Float64(get(config, "L_size",         20.0)),
         "scale_height_m" => Float64(get(config, "scale_height_m", 2000.0)),
         "n_photons"      => Int(    get(config, "photons",        10000)),
+        "field_compute_mode" => String(get(config, "field_compute_mode", "proxy_only")),
         "use_3d_density" => Bool(   get(config, "mc_use_3d_density", true)),
         "density_sampling" => String(get(config, "mc_density_sampling", "nearest")),
         "field_forward_half_angle_deg" =>
@@ -267,19 +268,21 @@ function step3_mc(field::Dict, scatter::Dict, mc_cfg::Dict, log_fn::Function)
     mc_cfg_local = copy(mc_cfg)
     use_3d = Bool(get(mc_cfg_local, "use_3d_density", true))
     density_mode = String(get(mc_cfg_local, "density_sampling", "nearest"))
+    requested_mode = normalize_field_compute_mode(get(mc_cfg_local, "field_compute_mode", "proxy_only"))
     if use_3d
         mc_cfg_local["density_grid"] = field["density_norm"]
         mc_cfg_local["field_axis"] = field["axis"]
         mc_cfg_local["field_xy_centered"] = true
     end
-    mc_cfg_local["collect_voxel_fields"] = true
+    mc_cfg_local["collect_voxel_fields"] = requested_mode != "proxy_only"
     mc_cfg_local["field_forward_half_angle_deg"] = Float64(get(mc_cfg, "field_forward_half_angle_deg", 90.0))
     mc_cfg_local["field_back_half_angle_deg"] = Float64(get(mc_cfg, "field_back_half_angle_deg", 90.0))
     mc_cfg_local["field_quadrature_polar"] = Int(get(mc_cfg, "field_quadrature_polar", 2))
     mc_cfg_local["field_quadrature_azimuth"] = Int(get(mc_cfg, "field_quadrature_azimuth", 6))
     mode_msg = use_3d ? "3D $(density_mode) + z_slab" : "1D profile"
-    log_fn(@sprintf(">> [3/4] Monte Carlo (%d 光子, %s)...",
-                    mc_cfg["n_photons"], mode_msg))
+    field_msg = requested_mode == "proxy_only" ? "proxy only" : "collect exact field"
+    log_fn(@sprintf(">> [3/4] Monte Carlo (%d 光子, %s, %s)...",
+                    mc_cfg["n_photons"], mode_msg, field_msg))
     t  = time()
     mc = run_monte_carlo(scatter, mc_cfg_local)
     log_fn(@sprintf(">> [3/4] 完成 %.2fs | R_back=%.5f R_trans=%.5f depol=%.4f",

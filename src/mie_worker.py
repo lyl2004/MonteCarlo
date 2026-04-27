@@ -88,19 +88,61 @@ DEFAULT_CONFIG = {
 }
 
 
-def build_field_catalog(config):
-    requested_mode = str(config.get('field_compute_mode', 'proxy_only'))
-    return {
-        "field_catalog": {
-            "proxy": [
-                {"name": "beta_back", "label": "后向代理场"},
-                {"name": "beta_forward", "label": "前向代理场"},
-                {"name": "depol_ratio", "label": "退偏代理场"},
-            ],
-        },
-        "available_field_families": ["proxy"],
+def normalize_field_compute_mode(mode):
+    mode = str(mode).strip().lower()
+    return mode if mode in {"proxy_only", "exact_only", "both"} else "proxy_only"
+
+
+def build_field_catalog(config, exact_available=False):
+    requested_mode = normalize_field_compute_mode(config.get('field_compute_mode', 'proxy_only'))
+    catalog = {}
+    if requested_mode != "exact_only":
+        catalog["proxy"] = [
+            {"name": "beta_back", "label": "后向代理场", "storage": "proxy_beta_back"},
+            {"name": "beta_forward", "label": "前向代理场", "storage": "proxy_beta_forward"},
+            {"name": "depol_ratio", "label": "退偏代理场", "storage": "proxy_depol_ratio"},
+            {"name": "density", "label": "密度场", "storage": "density"},
+        ]
+    if requested_mode != "proxy_only" and exact_available:
+        catalog["exact"] = [
+            {"name": "beta_back", "label": "后向精确场", "storage": "exact_beta_back"},
+            {"name": "beta_forward", "label": "前向精确场", "storage": "exact_beta_forward"},
+            {"name": "depol_ratio", "label": "退偏精确场", "storage": "exact_depol_ratio"},
+            {"name": "event_count", "label": "采样次数", "storage": "exact_event_count"},
+        ]
+    field_mode_note = ""
+    if not catalog:
+        catalog["proxy"] = [
+            {"name": "beta_back", "label": "后向代理场", "storage": "proxy_beta_back"},
+            {"name": "beta_forward", "label": "前向代理场", "storage": "proxy_beta_forward"},
+            {"name": "depol_ratio", "label": "退偏代理场", "storage": "proxy_depol_ratio"},
+            {"name": "density", "label": "密度场", "storage": "density"},
+        ]
+        field_mode_note = "exact field unavailable, fell back to proxy field only"
+    elif requested_mode == "both" and "exact" not in catalog:
+        field_mode_note = "exact field unavailable, exported proxy field only"
+
+    effective_mode = "both" if len(catalog) >= 2 else ("exact_only" if "exact" in catalog else "proxy_only")
+    meta = {
+        "field_catalog": catalog,
+        "available_field_families": [name for name in ("proxy", "exact") if name in catalog],
         "requested_field_compute_mode": requested_mode,
-        "effective_field_compute_mode": "proxy_only",
+        "effective_field_compute_mode": effective_mode,
+        "primary_field_family": "proxy" if "proxy" in catalog else next(iter(catalog)),
+    }
+    if field_mode_note:
+        meta["field_mode_note"] = field_mode_note
+    return meta
+
+
+def build_default_proxy_catalog():
+    return {
+            "proxy": [
+                {"name": "beta_back", "label": "后向代理场", "storage": "proxy_beta_back"},
+                {"name": "beta_forward", "label": "前向代理场", "storage": "proxy_beta_forward"},
+                {"name": "depol_ratio", "label": "退偏代理场", "storage": "proxy_depol_ratio"},
+                {"name": "density", "label": "密度场", "storage": "density"},
+            ],
     }
 
 def _mie_layer_count(config):
@@ -228,7 +270,6 @@ def generate_field(config, temp_dir: Path, optical_layers=None):
     temp_dir.mkdir(parents=True, exist_ok=True)
     L = config['L_size']
     axis = np.linspace(0, L, N)
-    X, Y, Z = np.meshgrid(axis, axis, axis, indexing='ij')
     rng = np.random.default_rng(101)
 
     def get_noise_layer(scale, strength):
@@ -249,7 +290,7 @@ def generate_field(config, temp_dir: Path, optical_layers=None):
     # 垂直高斯云廓线
     z_center = config['cloud_center_z']
     z_sigma = config['cloud_thickness'] / 2.355   # 高斯标准差
-    vertical_profile = np.exp(-0.5 * ((Z - z_center) / z_sigma)**2)
+    vertical_profile = np.exp(-0.5 * ((axis - z_center) / z_sigma)**2).reshape(1, 1, N)
 
     raw_density = vertical_profile * (0.3 + 0.7 * noise)
     density_norm = np.clip(raw_density, 0, 1)
@@ -273,19 +314,25 @@ def generate_field(config, temp_dir: Path, optical_layers=None):
     field_file = temp_dir / "field_data.npz"
     np.savez_compressed(
         field_file,
-        density=density_norm,
-        beta_vis=beta_back_vis,
-        beta_back=beta_back_vis,
-        beta_forward=beta_forward_vis,
-        depol_ratio=depol_ratio,
-        axis=axis,
-        lut_back=lut_back,
-        lut_forward=lut_forward,
-        lut_depol=lut_depol,
+        density=np.asfortranarray(density_norm.astype(np.float32)),
+        beta_vis=np.asfortranarray(beta_back_vis.astype(np.float32)),
+        beta_back=np.asfortranarray(beta_back_vis.astype(np.float32)),
+        beta_forward=np.asfortranarray(beta_forward_vis.astype(np.float32)),
+        depol_ratio=np.asfortranarray(depol_ratio.astype(np.float32)),
+        proxy_beta_back=np.asfortranarray(beta_back_vis.astype(np.float32)),
+        proxy_beta_forward=np.asfortranarray(beta_forward_vis.astype(np.float32)),
+        proxy_depol_ratio=np.asfortranarray(depol_ratio.astype(np.float32)),
+        axis=axis.astype(np.float32),
+        lut_back=lut_back.astype(np.float32),
+        lut_forward=lut_forward.astype(np.float32),
+        lut_depol=lut_depol.astype(np.float32),
+        proxy_lut_back=lut_back.astype(np.float32),
+        proxy_lut_forward=lut_forward.astype(np.float32),
+        proxy_lut_depol=lut_depol.astype(np.float32),
     )
 
     return {
-        'L': L, 'dim': N, 'mesh': (X, Y, Z),
+        'L': L, 'dim': N,
         'beta_ext': beta_ext_vis,
         'beta_back': beta_back_vis,
         'beta_back_vis': beta_back_vis,
@@ -301,90 +348,391 @@ def generate_field(config, temp_dir: Path, optical_layers=None):
 
 
 # =============================================================================
-# 3. 可视化渲染（离线模式，使用 PyVista + Panel）
+# 3. 可视化渲染（NPZ + 浏览器端 Plotly，与 Julia 后端同构）
 # =============================================================================
 
-def render_headless(data, config, output_dir: Path):
-    """
-    离线渲染三维场和切片，生成交互式 HTML 文件（使用 VTK 后端）。
-    输出多个视角的 3D 可视化。
-    """
-    log_msg(">> [Render] Starting Offline Renderer (Embedded Mode)...")
-    try:
-        import pyvista as pv
-        pv.set_plot_theme("document")
-    except ImportError as e:
-        log_msg(f"FATAL: 缺少 PyVista: {e}", "error")
-        return []
+def _summary_from_field(data):
+    total_back = float(np.sum(data['beta_back']))
+    total_forward = float(np.sum(data['beta_forward']))
+    lut_depol = np.asarray(data.get('lut_depol', []), dtype=float)
+    depol_back = float(np.nanmean(lut_depol)) if lut_depol.size else 0.0
+    return np.asarray([
+        total_back,
+        total_forward,
+        depol_back,
+        depol_back,
+        total_forward / total_back if total_back > 1e-30 else 0.0,
+        0.0,
+    ], dtype=np.float32)
 
-    L = data['L']
-    N = int(config.get('grid_dim', 120))
-    center = (L/2, L/2, L/2)
-    expl_dist = L * config.get('explode_dist', 0.7)
+
+def _summary_from_exact_fields(fields):
+    total_back = float(np.sum(fields["beta_back"]))
+    total_forward = float(np.sum(fields["beta_forward"]))
+    depol_back = 0.0
+    if total_back > 1e-20:
+        pol = np.sqrt(
+            float(np.sum(fields["back_Q"])) ** 2
+            + float(np.sum(fields["back_U"])) ** 2
+            + float(np.sum(fields["back_V"])) ** 2
+        ) / total_back
+        depol_back = float(np.clip(1.0 - pol, 0.0, 1.0))
+    depol_forward = 0.0
+    if total_forward > 1e-20:
+        pol = np.sqrt(
+            float(np.sum(fields["forward_Q"])) ** 2
+            + float(np.sum(fields["forward_U"])) ** 2
+            + float(np.sum(fields["forward_V"])) ** 2
+        ) / total_forward
+        depol_forward = float(np.clip(1.0 - pol, 0.0, 1.0))
+    return np.asarray([
+        total_back,
+        total_forward,
+        depol_back,
+        depol_forward,
+        total_forward / total_back if total_back > 1e-30 else 0.0,
+        float(np.sum(fields["event_count"])),
+    ], dtype=np.float32)
+
+
+def attach_exact_fields(data, sim_res):
+    voxel = sim_res.get("arrays", {}).get("voxel_fields")
+    if not voxel:
+        return False
+    back_I = np.asarray(voxel["back_I"], dtype=np.float64)
+    back_Q = np.asarray(voxel["back_Q"], dtype=np.float64)
+    back_U = np.asarray(voxel["back_U"], dtype=np.float64)
+    back_V = np.asarray(voxel["back_V"], dtype=np.float64)
+    forward_I = np.asarray(voxel["forward_I"], dtype=np.float64)
+    forward_Q = np.asarray(voxel["forward_Q"], dtype=np.float64)
+    forward_U = np.asarray(voxel["forward_U"], dtype=np.float64)
+    forward_V = np.asarray(voxel["forward_V"], dtype=np.float64)
+    event_count = np.asarray(voxel["event_count"], dtype=np.float64)
+
+    depol = np.zeros_like(back_I, dtype=np.float64)
+    mask = back_I > 1e-20
+    pol = np.zeros_like(back_I, dtype=np.float64)
+    pol[mask] = np.sqrt(back_Q[mask] ** 2 + back_U[mask] ** 2 + back_V[mask] ** 2) / back_I[mask]
+    depol[mask] = np.clip(1.0 - pol[mask], 0.0, 1.0)
+
+    data["exact_fields"] = {
+        "beta_back": back_I,
+        "beta_forward": forward_I,
+        "depol_ratio": depol,
+        "event_count": event_count,
+        "back_Q": back_Q,
+        "back_U": back_U,
+        "back_V": back_V,
+        "forward_Q": forward_Q,
+        "forward_U": forward_U,
+        "forward_V": forward_V,
+    }
+    return True
+
+
+def save_field_npz(data, output_dir: Path):
     output_dir.mkdir(parents=True, exist_ok=True)
+    density = np.asfortranarray(np.asarray(data['density_norm'], dtype=np.float32))
+    axis = np.asarray(np.linspace(0, data['L'], data['dim']), dtype=np.float32)
+    field_meta = data.get("field_meta") or build_field_catalog({}, exact_available="exact_fields" in data)
+    catalog = field_meta["field_catalog"]
+    primary_family = field_meta.get("primary_field_family", "proxy")
+    arrays = {
+        "density": density,
+        "axis": axis,
+        "meta": np.asarray([float(data['L']), float(data['dim']), 0.0], dtype=np.float32),
+    }
 
-    field_defs = [
-        ('beta_back_vis', 'Backscatter Proxy', 'viridis', ''),
-        ('beta_forward_vis', 'Forward Proxy', 'plasma', '__beta_forward'),
-        ('depol_ratio', 'Depolarization Proxy', 'cividis', '__depol_ratio'),
+    proxy_arrays = {
+        "beta_back": np.asfortranarray(np.asarray(data['beta_back'], dtype=np.float32)),
+        "beta_forward": np.asfortranarray(np.asarray(data['beta_forward'], dtype=np.float32)),
+        "depol_ratio": np.asfortranarray(np.asarray(data['depol_ratio'], dtype=np.float32)),
+        "lut_back": np.asarray(data['lut_back'], dtype=np.float32),
+        "lut_forward": np.asarray(data['lut_forward'], dtype=np.float32),
+        "lut_depol": np.asarray(data['lut_depol'], dtype=np.float32),
+        "summary": _summary_from_field(data),
+    }
+
+    if "proxy" in catalog:
+        arrays.update({
+            "proxy_beta_back": proxy_arrays["beta_back"],
+            "proxy_beta_forward": proxy_arrays["beta_forward"],
+            "proxy_depol_ratio": proxy_arrays["depol_ratio"],
+            "proxy_lut_back": proxy_arrays["lut_back"],
+            "proxy_lut_forward": proxy_arrays["lut_forward"],
+            "proxy_lut_depol": proxy_arrays["lut_depol"],
+            "proxy_summary": proxy_arrays["summary"],
+        })
+
+    exact_arrays = None
+    if "exact" in catalog and "exact_fields" in data:
+        exact = data["exact_fields"]
+        exact_arrays = {
+            "beta_back": np.asfortranarray(np.asarray(exact["beta_back"], dtype=np.float32)),
+            "beta_forward": np.asfortranarray(np.asarray(exact["beta_forward"], dtype=np.float32)),
+            "depol_ratio": np.asfortranarray(np.asarray(exact["depol_ratio"], dtype=np.float32)),
+            "event_count": np.asfortranarray(np.asarray(exact["event_count"], dtype=np.float32)),
+            "summary": _summary_from_exact_fields(exact),
+        }
+        arrays.update({
+            "exact_beta_back": exact_arrays["beta_back"],
+            "exact_beta_forward": exact_arrays["beta_forward"],
+            "exact_depol_ratio": exact_arrays["depol_ratio"],
+            "exact_event_count": exact_arrays["event_count"],
+            "exact_summary": exact_arrays["summary"],
+            "exact_back_Q": np.asfortranarray(np.asarray(exact["back_Q"], dtype=np.float32)),
+            "exact_back_U": np.asfortranarray(np.asarray(exact["back_U"], dtype=np.float32)),
+            "exact_back_V": np.asfortranarray(np.asarray(exact["back_V"], dtype=np.float32)),
+            "exact_forward_Q": np.asfortranarray(np.asarray(exact["forward_Q"], dtype=np.float32)),
+            "exact_forward_U": np.asfortranarray(np.asarray(exact["forward_U"], dtype=np.float32)),
+            "exact_forward_V": np.asfortranarray(np.asarray(exact["forward_V"], dtype=np.float32)),
+        })
+
+    primary = exact_arrays if primary_family == "exact" and exact_arrays is not None else proxy_arrays
+    arrays.update({
+        "beta_back": primary["beta_back"],
+        "beta_forward": primary["beta_forward"],
+        "depol_ratio": primary["depol_ratio"],
+        "summary": primary["summary"],
+    })
+    if primary_family == "proxy":
+        arrays.update({
+            "lut_back": proxy_arrays["lut_back"],
+            "lut_forward": proxy_arrays["lut_forward"],
+            "lut_depol": proxy_arrays["lut_depol"],
+        })
+    elif exact_arrays is not None:
+        arrays["event_count"] = exact_arrays["event_count"]
+
+    npz_path = output_dir / "density.npz"
+    np.savez_compressed(npz_path, **arrays)
+    return npz_path
+
+
+def _html_template(field_catalog_json: str, shape_info: str, view_name: str,
+                   eye_x: float, eye_y: float, eye_z: float) -> str:
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Mie {shape_info} - {view_name}</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script src="https://cdn.plot.ly/plotly-2.26.0.min.js"></script>
+  <style>
+    * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+    html, body {{ width: 100%; height: 100%; overflow: hidden; }}
+    body {{ position: relative; background: #111; color: #ccc; font-family: monospace; overscroll-behavior: none; }}
+    body.embed #toolbar {{ display: none; }}
+    #plot {{ position: absolute; inset: 0; width: 100%; height: 100%; min-width: 0; min-height: 0; }}
+    #toolbar {{ position: fixed; top: 8px; right: 8px; z-index: 120; display: flex; gap: 6px; flex-wrap: wrap; }}
+    #toolbar button {{ border: 1px solid #333; background: rgba(20,20,20,0.85); color: #ddd; padding: 6px 10px; border-radius: 6px; cursor: pointer; font-size: 11px; }}
+    #toolbar button.active {{ background: #2563eb; color: white; border-color: #3b82f6; }}
+    #loading {{ position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 14px; color: #aaa; z-index: 100; }}
+    #info {{ position: fixed; top: 8px; left: 8px; font-size: 11px; color: #666; pointer-events: none; }}
+  </style>
+</head>
+<body>
+  <div id="loading">正在加载数据...</div>
+  <div id="info">Mie {shape_info}</div>
+  <div id="toolbar"></div>
+  <div id="plot" style="display:none"></div>
+<script>
+const CAMERA_EYE = {{x: {eye_x:.2f}, y: {eye_y:.2f}, z: {eye_z:.2f}}};
+const URL_PARAMS = new URLSearchParams(window.location.search);
+const EMBED_MODE = URL_PARAMS.get('embed') === '1';
+const START_FAMILY = URL_PARAMS.get('family') || 'proxy';
+const START_FIELD = URL_PARAMS.get('field') || 'beta_back';
+const DATA_VERSION = URL_PARAMS.get('t') || String(Date.now());
+const FIELD_CATALOG = {field_catalog_json};
+if (EMBED_MODE) document.body.classList.add('embed');
+
+function parseNpy(buffer) {{
+  const view = new DataView(buffer);
+  if (view.getUint8(0) !== 0x93) throw new Error('不是有效的 npy 文件');
+  const major = view.getUint8(6);
+  const headerLen = major >= 2 ? view.getUint32(8, true) : view.getUint16(8, true);
+  const headerStart = major >= 2 ? 12 : 10;
+  const headerStr = new TextDecoder().decode(new Uint8Array(buffer, headerStart, headerLen));
+  const shapeMatch = headerStr.match(/'shape'\\s*:\\s*\\(([^)]+)\\)/);
+  if (!shapeMatch) throw new Error('无法解析 shape: ' + headerStr);
+  const shape = shapeMatch[1].split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+  const dtypeMatch = headerStr.match(/'descr'\\s*:\\s*'([^']+)'/);
+  const dtype = dtypeMatch ? dtypeMatch[1] : '<f4';
+  const dataBuffer = buffer.slice(headerStart + headerLen);
+  let arr;
+  if (dtype === '<f4' || dtype === '|f4') arr = new Float32Array(dataBuffer);
+  else if (dtype === '<f8') arr = new Float64Array(dataBuffer);
+  else if (dtype === '<i4' || dtype === '|i4') arr = new Int32Array(dataBuffer);
+  else throw new Error('不支持的 dtype: ' + dtype);
+  return {{data: arr, shape}};
+}}
+
+async function loadAndRender() {{
+  const loading = document.getElementById('loading');
+  const plotDiv = document.getElementById('plot');
+  const toolbar = document.getElementById('toolbar');
+  try {{
+    loading.textContent = '正在下载数据文件...';
+    const resp = await fetch('./density.npz?t=' + encodeURIComponent(DATA_VERSION), {{cache: 'no-store'}});
+    if (!resp.ok) throw new Error('fetch 失败: ' + resp.status);
+    const zip = await JSZip.loadAsync(await resp.arrayBuffer());
+    async function readArray(name) {{
+      const file = zip.file(name + '.npy');
+      if (!file) throw new Error('找不到 ' + name + '.npy');
+      return parseNpy(await file.async('arraybuffer'));
+    }}
+    async function readOptionalArray(name) {{
+      const file = zip.file(name + '.npy');
+      return file ? parseNpy(await file.async('arraybuffer')) : null;
+    }}
+    const densObj = await readArray('density');
+    const axisObj = await readArray('axis');
+    const summaryObj = await readArray('summary');
+    const N = densObj.shape[0];
+    const axis = axisObj.data;
+    const total = N * N * N;
+    const xs = new Float32Array(total), ys = new Float32Array(total), zs = new Float32Array(total);
+    let idx = 0;
+    for (let iz = 0; iz < N; iz++) for (let iy = 0; iy < N; iy++) for (let ix = 0; ix < N; ix++) {{
+      xs[idx] = axis[ix]; ys[idx] = axis[iy]; zs[idx] = axis[iz]; idx++;
+    }}
+    function colorscaleFor(fieldName) {{
+      if (fieldName === 'beta_forward') return 'Viridis';
+      if (fieldName === 'depol_ratio') return 'Cividis';
+      if (fieldName === 'density') return 'Hot';
+      return 'Hot';
+    }}
+    const fieldDefs = {{}};
+    const familySummaries = {{}};
+    for (const [familyName, entries] of Object.entries(FIELD_CATALOG)) {{
+      fieldDefs[familyName] = {{}};
+      const familySummaryObj = await readOptionalArray(familyName + '_summary');
+      familySummaries[familyName] = familySummaryObj ? familySummaryObj.data : summaryObj.data;
+      for (const entry of entries) {{
+        const storageName = entry.name === 'density' ? 'density' : (entry.storage || (familyName + '_' + entry.name));
+        const valuesObj = entry.name === 'density' ? densObj : await readArray(storageName);
+        fieldDefs[familyName][entry.name] = {{
+          label: entry.label || entry.name,
+          values: valuesObj.data,
+          colorscale: colorscaleFor(entry.name),
+          opacity: entry.name === 'depol_ratio' ? 0.18 : 0.12,
+        }};
+      }}
+    }}
+    function fieldRange(values, fieldName) {{
+      let vmin = Infinity, vmax = -Infinity;
+      for (let i = 0; i < values.length; i++) {{
+        const v = values[i];
+        if (!Number.isFinite(v)) continue;
+        if (v < vmin) vmin = v;
+        if (v > vmax) vmax = v;
+      }}
+      if (!Number.isFinite(vmin) || !Number.isFinite(vmax)) return {{isomin: 0, isomax: 1}};
+      if (fieldName === 'depol_ratio') return Math.abs(vmax - vmin) < Number.EPSILON ? {{isomin: Math.max(vmin - 1e-3, 0), isomax: vmin + 1e-3}} : {{isomin: Math.max(vmin, 0), isomax: vmax}};
+      if (vmax <= 0) return {{isomin: 0, isomax: 1}};
+      return {{isomin: Math.max(vmax * 0.05, Number.EPSILON), isomax: vmax}};
+    }}
+    function makeTrace(familyName, fieldName) {{
+      const def = fieldDefs[familyName][fieldName];
+      const range = fieldRange(def.values, fieldName);
+      return {{
+        type: 'volume', x: xs, y: ys, z: zs, value: def.values,
+        isomin: range.isomin, isomax: range.isomax,
+        opacity: def.opacity, surface: {{count: fieldName === 'depol_ratio' ? 8 : 6}},
+        colorscale: def.colorscale,
+        colorbar: {{title: {{text: def.label, font: {{color: '#aaa'}}}}, tickfont: {{color: '#aaa'}}, len: 0.6}},
+        caps: {{x: {{show: false}}, y: {{show: false}}, z: {{show: false}}}},
+      }};
+    }}
+    const layout = {{
+      paper_bgcolor: '#111',
+      scene: {{
+        xaxis: {{title: 'X [m]', color: '#888', gridcolor: '#333', backgroundcolor: '#111'}},
+        yaxis: {{title: 'Y [m]', color: '#888', gridcolor: '#333', backgroundcolor: '#111'}},
+        zaxis: {{title: 'Z [m]', color: '#888', gridcolor: '#333', backgroundcolor: '#111'}},
+        bgcolor: '#111', camera: {{eye: CAMERA_EYE}}, aspectmode: 'cube', uirevision: 'camera-lock',
+      }},
+      uirevision: 'field-switch', margin: {{l: 0, r: 0, b: 0, t: 0}},
+    }};
+    let currentFamily = Object.prototype.hasOwnProperty.call(fieldDefs, START_FAMILY) ? START_FAMILY : Object.keys(fieldDefs)[0];
+    let currentField = Object.prototype.hasOwnProperty.call(fieldDefs[currentFamily], START_FIELD) ? START_FIELD : Object.keys(fieldDefs[currentFamily])[0];
+    function updateInfo() {{
+      const def = fieldDefs[currentFamily][currentField];
+      const summary = familySummaries[currentFamily] || summaryObj.data;
+      const ratio = Number.isFinite(summary[4]) ? summary[4].toExponential(3) : '0';
+      const depolB = Number.isFinite(summary[2]) ? summary[2].toFixed(4) : '0.0000';
+      document.getElementById('info').textContent = `Mie {shape_info} | ${{currentFamily}} | ${{def.label}} | F/B=${{ratio}} | depol=${{depolB}}`;
+    }}
+    function setActiveButton() {{
+      Array.from(toolbar.querySelectorAll('button')).forEach(btn => btn.classList.toggle('active', btn.dataset.family === currentFamily && btn.dataset.field === currentField));
+    }}
+    async function renderField(familyName, fieldName) {{
+      if (!fieldDefs[familyName] || !fieldDefs[familyName][fieldName]) return;
+      currentFamily = familyName; currentField = fieldName;
+      const nextUrl = new URL(window.location.href);
+      nextUrl.searchParams.set('family', currentFamily);
+      nextUrl.searchParams.set('field', currentField);
+      window.history.replaceState(null, '', nextUrl.toString());
+      updateInfo(); setActiveButton();
+      await Plotly.react('plot', [makeTrace(familyName, fieldName)], layout, {{responsive: true, displaylogo: false, displayModeBar: !EMBED_MODE, scrollZoom: false, modeBarButtonsToRemove: ['toImage']}});
+    }}
+    if (!EMBED_MODE) {{
+      for (const [familyName, fields] of Object.entries(fieldDefs)) for (const [fieldName, def] of Object.entries(fields)) {{
+        const btn = document.createElement('button');
+        btn.textContent = familyName + ': ' + def.label;
+        btn.dataset.family = familyName; btn.dataset.field = fieldName;
+        btn.onclick = () => renderField(familyName, fieldName);
+        toolbar.appendChild(btn);
+      }}
+    }}
+    plotDiv.style.display = 'block';
+    window.addEventListener('message', async (event) => {{
+      const data = event && event.data ? event.data : null;
+      if (!data || data.type !== 'iitm:set_field') return;
+      await renderField(data.family || currentFamily, data.field);
+      try {{ Plotly.Plots.resize(plotDiv); }} catch (_) {{}}
+    }});
+    await renderField(currentFamily, currentField);
+    loading.style.display = 'none';
+  }} catch (err) {{
+    loading.textContent = '渲染失败: ' + err.message;
+    loading.style.color = '#f44';
+    console.error(err);
+  }}
+}}
+loadAndRender();
+</script>
+</body>
+</html>"""
+
+
+def render_headless(data, config, output_dir: Path):
+    """保存 Julia 同构 NPZ 并生成浏览器端 Plotly HTML。"""
+    log_msg(">> [Render] Saving NPZ + browser Plotly renderer...")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for old_html in output_dir.glob("render*.html"):
+        try:
+            old_html.unlink()
+        except Exception as exc:
+            log_msg(f"Warning: Failed to remove stale HTML {old_html.name}: {exc}", "warning")
+    save_field_npz(data, output_dir)
+
+    field_meta = data.get("field_meta") or build_field_catalog(config, exact_available="exact_fields" in data)
+    catalog_json = json.dumps(field_meta["field_catalog"], ensure_ascii=False)
+    shape_info = "sphere"
+    view_cfgs = [
+        ("render_main.html", (1.5, 1.8, 1.2)),
+        ("render_top.html", (0.0, 0.0, 2.5)),
+        ("render_front.html", (0.0, 2.5, 0.5)),
     ]
-    view_configs = [
-        ('render_main', [(3.0*L, 3.0*L, 2.2*L), center, (0, 0, 1)]),
-        ('render_bottom', [(center[0], center[1], center[2] - 3.5*L), center, (0, 1, 0)]),
-        ('render_front', [(center[0], center[1] - 3.5*L, center[2]), center, (0, 0, 1)]),
-        ('render_left', [(center[0] - 3.5*L, center[1], center[2]), center, (0, 0, 1)]),
-    ]
-    X, Y, Z = data['mesh']
     generated_files = []
-
-    def add_slice(plotter, scalar_name, cmap_name, x, y, z, val, vec_move):
-        """添加一个切片平面并平移显示"""
-        m = pv.StructuredGrid(x, y, z)
-        m.point_data[scalar_name] = val.flatten(order="F")
-        m.translate(np.array(vec_move) * expl_dist, inplace=True)
-        plotter.add_mesh(m, scalars=scalar_name, cmap=cmap_name, opacity=0.9, show_scalar_bar=False)
-        plotter.add_mesh(m.outline(), color="black", line_width=1)
-
-    def build_plotter():
-        plotter = pv.Plotter(off_screen=True, window_size=[1000, 800])
-        plotter.set_background("white")
-        grid = pv.ImageData()
-        grid.dimensions = data['beta_ext'].shape
-        grid.origin = (0, 0, 0)
-        grid.spacing = (L/(N-1), L/(N-1), L/(N-1))
-        grid.point_data["Extinction"] = data['beta_ext'].flatten(order="F")
-        points = grid.cast_to_pointset()
-        ext_threshold = max(float(np.max(data['beta_ext'])) * 0.05, 1e-12)
-        valid_points = points.threshold(ext_threshold, scalars="Extinction")
-        plotter.add_mesh(valid_points, scalars="Extinction", cmap="jet",
-                         style="points", point_size=3.0, render_points_as_spheres=True,
-                         opacity="sigmoid", show_scalar_bar=False)
-        plotter.add_mesh(grid.outline(), color="grey", line_width=1)
-        return plotter
-
-    for field_key, scalar_name, cmap_name, suffix in field_defs:
-        field_vis = data[field_key]
-        pl = build_plotter()
-        add_slice(pl, scalar_name, cmap_name, X[:, :, 0], Y[:, :, 0], Z[:, :, 0], field_vis[:, :, 0], (0, 0, -1))
-        add_slice(pl, scalar_name, cmap_name, X[:, 0, :], Y[:, 0, :], Z[:, 0, :], field_vis[:, 0, :], (0, -1, 0))
-        add_slice(pl, scalar_name, cmap_name, X[0, :, :], Y[0, :, :], Z[0, :, :], field_vis[0, :, :], (-1, 0, 0))
-
-        for view_stem, cam_pos in view_configs:
-            filename = f"{view_stem}{suffix}.html"
-            file_path = output_dir / filename
-            log_msg(f"   -> Exporting View: {filename}")
-            try:
-                pl.camera_position = cam_pos
-                pl.render()
-                vtk_pane = pn.pane.VTK(pl.ren_win, width=1000, height=800,
-                                       enable_keybindings=True, orientation_widget=True)
-                vtk_pane.save(str(file_path), resources='inline', embed=True, title=f"MieSim - {filename}")
-                generated_files.append(filename)
-            except Exception as e:
-                log_msg(f"ERROR: Export failed for {filename}: {str(e)}", "error")
-                traceback.print_exc()
-        pl.close()
-
+    for filename, eye in view_cfgs:
+        (output_dir / filename).write_text(
+            _html_template(catalog_json, shape_info, filename, *eye),
+            encoding="utf-8",
+        )
+        generated_files.append(filename)
+        log_msg(f"   -> Exporting View: {filename}")
     return generated_files
 
 
@@ -443,9 +791,9 @@ def run_consistency_tests():
         return sim, config
 
     # ------------------------------------------------------------------
-    # TC‑E: 能量守恒（无吸收）
+    # TC-E: 能量守恒（无吸收）
     # ------------------------------------------------------------------
-    print("\n[TC‑E] 能量守恒 (无吸收)")
+    print("\n[TC-E] 能量守恒 (无吸收)")
     config_e = {
         'L_size': 20.0, 'grid_dim': 60,
         'cloud_center_z': 10.0, 'cloud_thickness': 18.0,
@@ -464,9 +812,9 @@ def run_consistency_tests():
     print(f"   Sum = {sim_e['scalars']['R_back'] + sim_e['scalars']['R_trans']:.6f}")
 
     # ------------------------------------------------------------------
-    # TC‑A: 吸收守恒
+    # TC-A: 吸收守恒
     # ------------------------------------------------------------------
-    print("\n[TC‑A] 能量守恒 (有吸收)")
+    print("\n[TC-A] 能量守恒 (有吸收)")
     config_a = config_e.copy()
     layer_a = [{'thickness_m': 20.0, 'visibility_km': 5.0, 'radius_um': 5.0, 'm_real': 1.33, 'm_imag': 0.001}]
     sim_a, _ = run_test_simulation(config_a, layer_a)
@@ -476,9 +824,9 @@ def run_consistency_tests():
     print(f"   Sum = {sim_a['scalars']['R_back'] + sim_a['scalars']['R_trans'] + sim_a['scalars']['R_abs']:.6f}")
 
     # ------------------------------------------------------------------
-    # TC‑P: 偏振保持
+    # TC-P: 偏振保持
     # ------------------------------------------------------------------
-    print("\n[TC‑P] 偏振保持 (线偏振入射)")
+    print("\n[TC-P] 偏振保持 (线偏振入射)")
     config_p = {
         'L_size': 10.0, 'grid_dim': 50,
         'cloud_center_z': 5.0, 'cloud_thickness': 8.0,
@@ -495,9 +843,9 @@ def run_consistency_tests():
     print(f"   Depolarization ratio = {sim_p['scalars']['depol']:.6f}")
 
     # ------------------------------------------------------------------
-    # TC‑R: 瑞利极限（波长比）
+    # TC-R: 瑞利极限（波长比）
     # ------------------------------------------------------------------
-    print("\n[TC‑R] 瑞利极限 (粒径0.01μm, 比较1.55μm和0.55μm后向回波)")
+    print("\n[TC-R] 瑞利极限 (粒径0.01um, 比较1.55um和0.55um后向回波)")
     config_r_base = {
         'L_size': 10.0, 'grid_dim': 60,
         'cloud_center_z': 5.0, 'cloud_thickness': 9.0,
@@ -510,12 +858,12 @@ def run_consistency_tests():
         'wavelength_um': 1.55
     }
     layer_r = [{'thickness_m': 10.0, 'visibility_km': 0.1, 'radius_um': 0.01, 'm_real': 1.33, 'm_imag': 0.0}]
-    # 1.55 μm
+    # 1.55 um
     config_r1 = config_r_base.copy()
     config_r1['wavelength_um'] = 1.55
     sim_r1, _ = run_test_simulation(config_r1, layer_r, angstrom_q=4.0)
     back_1550 = sim_r1['scalars']['R_back']
-    # 0.55 μm
+    # 0.55 um
     config_r2 = config_r_base.copy()
     config_r2['wavelength_um'] = 0.55
     sim_r2, _ = run_test_simulation(config_r2, layer_r, angstrom_q=4.0)
@@ -524,14 +872,14 @@ def run_consistency_tests():
         ratio = back_550 / back_1550
     else:
         ratio = float('inf')
-    print(f"   R_back @ 1.55 μm = {back_1550:.6e}")
-    print(f"   R_back @ 0.55 μm = {back_550:.6e}")
+    print(f"   R_back @ 1.55 um = {back_1550:.6e}")
+    print(f"   R_back @ 0.55 um = {back_550:.6e}")
     print(f"   Ratio (550/1550) = {ratio:.3f}")
 
     # ------------------------------------------------------------------
-    # TC‑G: 几何光学极限（大粒径后向概率）
+    # TC-G: 几何光学极限（大粒径后向概率）
     # ------------------------------------------------------------------
-    print("\n[TC‑G] 几何光学极限 (粒径5μm, 无吸收, 后向散射概率)")
+    print("\n[TC-G] 几何光学极限 (粒径5um, 无吸收, 后向散射概率)")
     config_g = {
         'L_size': 10.0, 'grid_dim': 50,
         'cloud_center_z': 5.0, 'cloud_thickness': 8.0,
@@ -548,9 +896,9 @@ def run_consistency_tests():
     print(f"   R_back (MC) = {sim_g['scalars']['R_back']:.6f}")
 
     # ------------------------------------------------------------------
-    # TC‑L: 对数正态分布积分（体积消光系数）
+    # TC-L: 对数正态分布积分（体积消光系数）
     # ------------------------------------------------------------------
-    print("\n[TC‑L] 对数正态分布积分 (体积消光系数 Bext)")
+    print("\n[TC-L] 对数正态分布积分 (体积消光系数 Bext)")
     try:
         r_g = 2.0
         sigma_ln = 0.35
@@ -566,9 +914,9 @@ def run_consistency_tests():
             q_ext = AutoMieQ(m, wl_nm, 2*r, asDict=False)[0]
             cross = q_ext * np.pi * (r*1e-6)**2
             Bext_manual += w * cross * 1e6
-        print(f"   Bext (manual integration) = {Bext_manual:.6e} m⁻¹")
+        print(f"   Bext (manual integration) = {Bext_manual:.6e} m^-1")
     except Exception as e:
-        print(f"   TC‑L 手动积分失败: {e}")
+        print(f"   TC-L 手动积分失败: {e}")
 
     print("\n" + "="*60)
     print(">> 数据收集完成，请手动对比理论值。")
@@ -613,12 +961,9 @@ def main():
         config.update(user_config)
         config['grid_dim'] = int(config.get('grid_dim', 120))
         config['photons'] = int(config.get('photons', 50000))
-        field_meta = build_field_catalog(config)
-        if field_meta["requested_field_compute_mode"] != field_meta["effective_field_compute_mode"]:
-            log_msg(
-                f">> [FieldMode] requested={field_meta['requested_field_compute_mode']} "
-                f"but current Mie worker only exports {field_meta['effective_field_compute_mode']}"
-            )
+        requested_mode = normalize_field_compute_mode(config.get('field_compute_mode', 'proxy_only'))
+        collect_exact_fields = requested_mode != "proxy_only"
+        field_meta = build_field_catalog(config, exact_available=collect_exact_fields)
         temp_dir, output_dir = setup_directories(args.project_name)
 
         t0 = time.time()
@@ -642,7 +987,21 @@ def main():
             source_width_m=field_data['L'],
             sigma_ln=config['sigma_ln'],
             angstrom_q=config.get('angstrom_q', 1.3),
+            collect_voxel_fields=collect_exact_fields,
+            field_forward_half_angle_deg=float(config.get('field_forward_half_angle_deg', 90.0)),
+            field_back_half_angle_deg=float(config.get('field_back_half_angle_deg', 90.0)),
+            field_quadrature_polar=int(config.get('field_quadrature_polar', 2)),
+            field_quadrature_azimuth=int(config.get('field_quadrature_azimuth', 6)),
         )
+
+        exact_available = attach_exact_fields(field_data, sim_res)
+        field_meta = build_field_catalog(config, exact_available=exact_available)
+        field_data["field_meta"] = field_meta
+        if field_meta["requested_field_compute_mode"] != field_meta["effective_field_compute_mode"]:
+            log_msg(
+                f">> [FieldMode] requested={field_meta['requested_field_compute_mode']} "
+                f"but current Mie worker exports {field_meta['effective_field_compute_mode']}"
+            )
 
         sim_file = temp_dir / "sim_results.npy"
         np.save(sim_file, sim_res)

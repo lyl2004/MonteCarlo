@@ -139,6 +139,213 @@ def apply_mueller(stokes, M11, M12, M33, M34):
     return np.array([1.0, Q_new, U_new, V_new]), I_out_rel
 
 
+@jit(nopython=True, cache=True)
+def sample_density_nearest_numba(density, origin, step, x, y, z):
+    nx, ny, nz = density.shape
+    fx = (x - origin[0]) / step[0]
+    fy = (y - origin[1]) / step[1]
+    fz = (z - origin[2]) / step[2]
+    ix = int(np.round(fx))
+    iy = int(np.round(fy))
+    iz = int(np.round(fz))
+    if ix < 0 or ix >= nx or iy < 0 or iy >= ny or iz < 0 or iz >= nz:
+        return 0.0
+    return density[ix, iy, iz]
+
+
+@jit(nopython=True, cache=True)
+def voxel_index_numba(origin, step, shape_arr, x, y, z):
+    fx = (x - origin[0]) / step[0]
+    fy = (y - origin[1]) / step[1]
+    fz = (z - origin[2]) / step[2]
+    ix = int(np.round(fx))
+    iy = int(np.round(fy))
+    iz = int(np.round(fz))
+    if ix < 0 or ix >= shape_arr[0] or iy < 0 or iy >= shape_arr[1] or iz < 0 or iz >= shape_arr[2]:
+        return -1, -1, -1
+    return ix, iy, iz
+
+
+@jit(nopython=True, cache=True)
+def slab_index_numba(z, z_edges):
+    n = z_edges.shape[0] - 1
+    if n <= 1:
+        return 0
+    if z <= z_edges[0]:
+        return 0
+    if z >= z_edges[n]:
+        return n - 1
+    idx = np.searchsorted(z_edges, z, side="right") - 1
+    if idx < 0:
+        return 0
+    if idx >= n:
+        return n - 1
+    return idx
+
+
+@jit(nopython=True, cache=True)
+def distance_to_slab_boundary_numba(z, uz, slab_idx, z_edges):
+    if uz > 1e-12:
+        return (z_edges[slab_idx + 1] - z) / uz
+    if uz < -1e-12:
+        return (z_edges[slab_idx] - z) / uz
+    return np.inf
+
+
+@jit(nopython=True, cache=True)
+def direction_to_scattering_angles_numba(ux, uy, uz, dxo, dyo, dzo):
+    ct = ux * dxo + uy * dyo + uz * dzo
+    if ct > 1.0:
+        ct = 1.0
+    if ct < -1.0:
+        ct = -1.0
+    theta = np.arccos(ct)
+    if np.abs(uz) > 0.99999:
+        return theta, np.arctan2(dyo, dxo)
+
+    sq = np.sqrt(max(1.0 - uz * uz, 1e-20))
+    e1x = ux * uz / sq
+    e1y = uy * uz / sq
+    e1z = -sq
+    e2x = -uy / sq
+    e2y = ux / sq
+    e2z = 0.0
+    px = dxo - ct * ux
+    py = dyo - ct * uy
+    pz = dzo - ct * uz
+    a = px * e1x + py * e1y + pz * e1z
+    b = px * e2x + py * e2y + pz * e2z
+    return theta, np.arctan2(b, a)
+
+
+@jit(nopython=True, cache=True)
+def interpolate_mueller_numba(mie_angles_deg, mie_tables_all, mie_id, theta_deg):
+    idx1 = np.searchsorted(mie_angles_deg, theta_deg)
+    if idx1 == 0:
+        idx0 = 0
+        f = 0.0
+    elif idx1 >= len(mie_angles_deg):
+        idx0 = len(mie_angles_deg) - 1
+        idx1 = idx0
+        f = 0.0
+    else:
+        idx0 = idx1 - 1
+        denom = mie_angles_deg[idx1] - mie_angles_deg[idx0]
+        f = 0.0 if denom <= 1e-12 else (theta_deg - mie_angles_deg[idx0]) / denom
+
+    return (
+        mie_tables_all[mie_id, 0, idx0] * (1.0 - f) + mie_tables_all[mie_id, 0, idx1] * f,
+        mie_tables_all[mie_id, 1, idx0] * (1.0 - f) + mie_tables_all[mie_id, 1, idx1] * f,
+        mie_tables_all[mie_id, 2, idx0] * (1.0 - f) + mie_tables_all[mie_id, 2, idx1] * f,
+        mie_tables_all[mie_id, 3, idx0] * (1.0 - f) + mie_tables_all[mie_id, 3, idx1] * f,
+    )
+
+
+@jit(nopython=True, cache=True)
+def local_beta_numba(use_3d_grid, grid_density, grid_origin, grid_step,
+                     layer_boundaries, layer_betas, x, y, z):
+    layer_idx = get_layer_index(z, layer_boundaries)
+    if layer_idx == -1:
+        return 0.0
+    beta = layer_betas[layer_idx]
+    if use_3d_grid:
+        beta *= sample_density_nearest_numba(grid_density, grid_origin, grid_step, x, y, z)
+    return beta
+
+
+@jit(nopython=True, cache=True)
+def escape_transmittance_numba(use_3d_grid, grid_density, grid_origin, grid_step,
+                               layer_boundaries, layer_betas, thickness,
+                               x, y, z, ux, uy, uz):
+    if np.abs(uz) <= 1e-12:
+        return 0.0
+    if uz > 0.0:
+        s_exit = (thickness - z) / uz
+    else:
+        s_exit = -z / uz
+    if s_exit <= 0.0:
+        return 0.0
+
+    min_step = grid_step[0]
+    if grid_step[1] < min_step:
+        min_step = grid_step[1]
+    if grid_step[2] < min_step:
+        min_step = grid_step[2]
+    step_len = max(min_step * 0.75, 1e-3)
+    n_steps = max(1, int(np.ceil(s_exit / step_len)))
+    ds = s_exit / n_steps
+    tau = 0.0
+    for i in range(n_steps):
+        s_mid = (i + 0.5) * ds
+        xm = x + s_mid * ux
+        ym = y + s_mid * uy
+        zm = z + s_mid * uz
+        tau += local_beta_numba(
+            use_3d_grid, grid_density, grid_origin, grid_step,
+            layer_boundaries, layer_betas, xm, ym, zm
+        ) * ds
+    return np.exp(-tau)
+
+
+@jit(nopython=True, cache=True)
+def accumulate_detector_contribution_numba(
+    forward_I, forward_Q, forward_U, forward_V,
+    back_I, back_Q, back_U, back_V, event_count,
+    ix, iy, iz, stokes, weight, ux, uy, uz, mie_id,
+    use_3d_grid, grid_density, grid_origin, grid_step,
+    layer_boundaries, layer_betas, thickness,
+    x, y, z, mie_angles_deg, mie_tables_all,
+    forward_dirs, forward_weights, back_dirs, back_weights
+):
+    event_count[ix, iy, iz] += 1.0
+
+    for i in range(forward_weights.shape[0]):
+        dxo = forward_dirs[i, 0]
+        dyo = forward_dirs[i, 1]
+        dzo = forward_dirs[i, 2]
+        theta, phi = direction_to_scattering_angles_numba(ux, uy, uz, dxo, dyo, dzo)
+        M11, M12, M33, M34 = interpolate_mueller_numba(
+            mie_angles_deg, mie_tables_all, mie_id, theta * 180.0 / np.pi
+        )
+        stokes_rot = rotate_stokes_numba(stokes, -phi)
+        stokes_out, i_factor = apply_mueller_numba(stokes_rot, M11, M12, M33, M34)
+        if i_factor <= 0.0:
+            continue
+        trans = escape_transmittance_numba(
+            use_3d_grid, grid_density, grid_origin, grid_step,
+            layer_boundaries, layer_betas, thickness,
+            x, y, z, dxo, dyo, dzo
+        )
+        contrib = weight * i_factor * trans * forward_weights[i]
+        forward_I[ix, iy, iz] += contrib
+        forward_Q[ix, iy, iz] += contrib * stokes_out[1]
+        forward_U[ix, iy, iz] += contrib * stokes_out[2]
+        forward_V[ix, iy, iz] += contrib * stokes_out[3]
+
+    for i in range(back_weights.shape[0]):
+        dxo = back_dirs[i, 0]
+        dyo = back_dirs[i, 1]
+        dzo = back_dirs[i, 2]
+        theta, phi = direction_to_scattering_angles_numba(ux, uy, uz, dxo, dyo, dzo)
+        M11, M12, M33, M34 = interpolate_mueller_numba(
+            mie_angles_deg, mie_tables_all, mie_id, theta * 180.0 / np.pi
+        )
+        stokes_rot = rotate_stokes_numba(stokes, -phi)
+        stokes_out, i_factor = apply_mueller_numba(stokes_rot, M11, M12, M33, M34)
+        if i_factor <= 0.0:
+            continue
+        trans = escape_transmittance_numba(
+            use_3d_grid, grid_density, grid_origin, grid_step,
+            layer_boundaries, layer_betas, thickness,
+            x, y, z, dxo, dyo, dzo
+        )
+        contrib = weight * i_factor * trans * back_weights[i]
+        back_I[ix, iy, iz] += contrib
+        back_Q[ix, iy, iz] += contrib * stokes_out[1]
+        back_U[ix, iy, iz] += contrib * stokes_out[2]
+        back_V[ix, iy, iz] += contrib * stokes_out[3]
+
+
 # =============================================================================
 # 蒙特卡洛内核 (Numba 并行)
 # =============================================================================
@@ -246,12 +453,9 @@ def mc_kernel_advanced(
             mie_id = layer_mie_ids[layer_idx]
 
             if use_3d_grid:
-                # 修复：使用 math.floor
-                gx = int(math.floor((x_new - g_ox) / g_dx))
-                gy = int(math.floor((y_new - g_oy) / g_dy))
-                gz = int(math.floor((z_new - g_oz) / g_dz))
-                if 0 <= gx < g_nx and 0 <= gy < g_ny and 0 <= gz < g_nz:
-                    beta_local *= grid_density[gx, gy, gz]
+                beta_local *= sample_density_nearest_numba(
+                    grid_density, grid_origin, grid_step, x_new, y_new, z_new
+                )
 
             x, y, z = x_new, y_new, z_new
 
@@ -356,6 +560,7 @@ def mc_kernel_advanced_fast(
     incident_angle_rad,
     source_type, source_width_x, source_width_y,
     use_3d_grid, grid_density, grid_origin, grid_step,
+    z_edges, slab_betas, slab_eps,
     theta_rad_grid, cdf_grids_all, mie_angles_deg, mie_tables_all
 ):
     if beta_max_global <= 0:
@@ -391,10 +596,54 @@ def mc_kernel_advanced_fast(
 
         alive = True
         while alive:
+            beta_majorant = beta_max_global
+            s_boundary = np.inf
+            if use_3d_grid:
+                slab_idx = slab_index_numba(z, z_edges)
+                beta_majorant = slab_betas[slab_idx]
+                s_boundary = distance_to_slab_boundary_numba(z, uz, slab_idx, z_edges)
+                if beta_majorant <= 1e-30:
+                    if np.isfinite(s_boundary):
+                        s_move = s_boundary + slab_eps
+                        x_new = x + s_move * ux
+                        y_new = y + s_move * uy
+                        z_new = z + s_move * uz
+                        if z_new < layer_boundaries[0]:
+                            back_count += 1
+                            total_back_I += weight
+                            total_back_Q += stokes[1] * weight
+                            total_back_U += stokes[2] * weight
+                            total_back_V += stokes[3] * weight
+                            break
+                        if z_new >= layer_boundaries[-1]:
+                            trans_count += 1
+                            break
+                        x, y, z = x_new, y_new, z_new
+                        continue
+                    beta_majorant = beta_max_global
+
             r_step = np.random.random()
             if r_step < 1e-12:
                 r_step = 1e-12
-            s_tent = -np.log(r_step) / beta_max_global
+            s_tent = -np.log(r_step) / beta_majorant
+
+            if use_3d_grid and np.isfinite(s_boundary) and s_tent >= s_boundary:
+                s_move = s_boundary + slab_eps
+                x_new = x + s_move * ux
+                y_new = y + s_move * uy
+                z_new = z + s_move * uz
+                if z_new < layer_boundaries[0]:
+                    back_count += 1
+                    total_back_I += weight
+                    total_back_Q += stokes[1] * weight
+                    total_back_U += stokes[2] * weight
+                    total_back_V += stokes[3] * weight
+                    break
+                if z_new >= layer_boundaries[-1]:
+                    trans_count += 1
+                    break
+                x, y, z = x_new, y_new, z_new
+                continue
 
             x_new = x + s_tent * ux
             y_new = y + s_tent * uy
@@ -421,15 +670,13 @@ def mc_kernel_advanced_fast(
             mie_id = layer_mie_ids[layer_idx]
 
             if use_3d_grid:
-                gx = int(math.floor((x_new - g_ox) / g_dx))
-                gy = int(math.floor((y_new - g_oy) / g_dy))
-                gz = int(math.floor((z_new - g_oz) / g_dz))
-                if 0 <= gx < g_nx and 0 <= gy < g_ny and 0 <= gz < g_nz:
-                    beta_local *= grid_density[gx, gy, gz]
+                beta_local *= sample_density_nearest_numba(
+                    grid_density, grid_origin, grid_step, x_new, y_new, z_new
+                )
 
             x, y, z = x_new, y_new, z_new
 
-            if np.random.random() > (beta_local / beta_max_global):
+            if np.random.random() > (beta_local / beta_majorant):
                 continue
 
             if np.random.random() > omega_layer:
@@ -515,13 +762,282 @@ def mc_kernel_advanced_fast(
             total_back_I, total_back_Q, total_back_U, total_back_V)
 
 
+@jit(nopython=True, nogil=True)
+def mc_kernel_advanced_exact(
+    n_photons,
+    layer_boundaries, layer_betas, layer_omegas, layer_mie_ids, beta_max_global,
+    incident_angle_rad,
+    source_type, source_width_x, source_width_y,
+    use_3d_grid, grid_density, grid_origin, grid_step,
+    z_edges, slab_betas, slab_eps,
+    theta_rad_grid, cdf_grids_all, mie_angles_deg, mie_tables_all,
+    forward_dirs, forward_weights, back_dirs, back_weights,
+    forward_I, forward_Q, forward_U, forward_V,
+    back_I, back_Q, back_U, back_V, event_count
+):
+    if beta_max_global <= 0:
+        return 0, 0, 0, n_photons, 0.0, 0.0, 0.0, 0.0
+
+    total_collisions = 0
+    absorbed_count = 0
+    back_count = 0
+    trans_count = 0
+    total_back_I = 0.0
+    total_back_Q = 0.0
+    total_back_U = 0.0
+    total_back_V = 0.0
+
+    init_ux = np.sin(incident_angle_rad)
+    init_uz = np.cos(incident_angle_rad)
+    g_nx, g_ny, g_nz = grid_density.shape
+    shape_arr = np.array([g_nx, g_ny, g_nz], dtype=np.int64)
+    thickness = layer_boundaries[-1]
+
+    for _ in range(n_photons):
+        x, y, z = 0.0, 0.0, 0.0
+        if source_type == 1:
+            x = (np.random.random() - 0.5) * source_width_x
+            y = (np.random.random() - 0.5) * source_width_y
+
+        ux, uy, uz = init_ux, 0.0, init_uz
+        stokes = np.array([1.0, 1.0, 0.0, 0.0])
+        weight = 1.0
+
+        alive = True
+        while alive:
+            beta_majorant = beta_max_global
+            s_boundary = np.inf
+            if use_3d_grid:
+                slab_idx = slab_index_numba(z, z_edges)
+                beta_majorant = slab_betas[slab_idx]
+                s_boundary = distance_to_slab_boundary_numba(z, uz, slab_idx, z_edges)
+                if beta_majorant <= 1e-30:
+                    if np.isfinite(s_boundary):
+                        s_move = s_boundary + slab_eps
+                        x_new = x + s_move * ux
+                        y_new = y + s_move * uy
+                        z_new = z + s_move * uz
+                        if z_new < layer_boundaries[0]:
+                            back_count += 1
+                            total_back_I += weight
+                            total_back_Q += stokes[1] * weight
+                            total_back_U += stokes[2] * weight
+                            total_back_V += stokes[3] * weight
+                            break
+                        if z_new >= layer_boundaries[-1]:
+                            trans_count += 1
+                            break
+                        x, y, z = x_new, y_new, z_new
+                        continue
+                    beta_majorant = beta_max_global
+
+            r_step = np.random.random()
+            if r_step < 1e-12:
+                r_step = 1e-12
+            s_tent = -np.log(r_step) / beta_majorant
+
+            if use_3d_grid and np.isfinite(s_boundary) and s_tent >= s_boundary:
+                s_move = s_boundary + slab_eps
+                x_new = x + s_move * ux
+                y_new = y + s_move * uy
+                z_new = z + s_move * uz
+                if z_new < layer_boundaries[0]:
+                    back_count += 1
+                    total_back_I += weight
+                    total_back_Q += stokes[1] * weight
+                    total_back_U += stokes[2] * weight
+                    total_back_V += stokes[3] * weight
+                    break
+                if z_new >= layer_boundaries[-1]:
+                    trans_count += 1
+                    break
+                x, y, z = x_new, y_new, z_new
+                continue
+
+            x_new = x + s_tent * ux
+            y_new = y + s_tent * uy
+            z_new = z + s_tent * uz
+
+            if z_new < layer_boundaries[0]:
+                back_count += 1
+                total_back_I += weight
+                total_back_Q += stokes[1] * weight
+                total_back_U += stokes[2] * weight
+                total_back_V += stokes[3] * weight
+                break
+
+            if z_new >= layer_boundaries[-1]:
+                trans_count += 1
+                break
+
+            layer_idx = get_layer_index(z_new, layer_boundaries)
+            if layer_idx == -1:
+                continue
+
+            beta_local = layer_betas[layer_idx]
+            omega_layer = layer_omegas[layer_idx]
+            mie_id = layer_mie_ids[layer_idx]
+            if use_3d_grid:
+                beta_local *= sample_density_nearest_numba(
+                    grid_density, grid_origin, grid_step, x_new, y_new, z_new
+                )
+
+            x, y, z = x_new, y_new, z_new
+
+            if np.random.random() > (beta_local / beta_majorant):
+                continue
+
+            if np.random.random() > omega_layer:
+                absorbed_count += 1
+                break
+
+            total_collisions += 1
+
+            if use_3d_grid:
+                vx, vy, vz = voxel_index_numba(grid_origin, grid_step, shape_arr, x, y, z)
+                if vx >= 0:
+                    accumulate_detector_contribution_numba(
+                        forward_I, forward_Q, forward_U, forward_V,
+                        back_I, back_Q, back_U, back_V, event_count,
+                        vx, vy, vz, stokes, weight, ux, uy, uz, mie_id,
+                        use_3d_grid, grid_density, grid_origin, grid_step,
+                        layer_boundaries, layer_betas, thickness,
+                        x, y, z, mie_angles_deg, mie_tables_all,
+                        forward_dirs, forward_weights, back_dirs, back_weights
+                    )
+
+            theta_s = sample_scattering_theta_layer(np.random.random(), theta_rad_grid, cdf_grids_all, mie_id)
+            phi_s = np.random.random() * 2 * np.pi
+
+            ux_old, uy_old, uz_old = ux, uy, uz
+            stokes = rotate_stokes_numba(stokes, -phi_s)
+
+            M11, M12, M33, M34 = interpolate_mueller_numba(
+                mie_angles_deg, mie_tables_all, mie_id, theta_s * 180.0 / np.pi
+            )
+            stokes, I_factor = apply_mueller_numba(stokes, M11, M12, M33, M34)
+            weight *= I_factor
+
+            st, ct = np.sin(theta_s), np.cos(theta_s)
+            sp, cp = np.sin(phi_s), np.cos(phi_s)
+            if np.abs(uz_old) > 0.99999:
+                ux = st * cp
+                uy = st * sp
+                uz = ct * np.sign(uz_old)
+            else:
+                sqrt_part = np.sqrt(1 - uz_old * uz_old)
+                n_ux = st * (ux_old * uz_old * cp - uy_old * sp) / sqrt_part + ux_old * ct
+                n_uy = st * (uy_old * uz_old * cp + ux_old * sp) / sqrt_part + uy_old * ct
+                n_uz = -st * cp * sqrt_part + uz_old * ct
+                ux, uy, uz = n_ux, n_uy, n_uz
+            norm = np.sqrt(ux * ux + uy * uy + uz * uz)
+            ux /= norm
+            uy /= norm
+            uz /= norm
+
+            if np.abs(uz_old) > 0.999999:
+                N_old_x, N_old_y, N_old_z = 0.0, 1.0, 0.0
+            else:
+                N_old_x = uy_old
+                N_old_y = -ux_old
+                N_old_z = 0.0
+                n_old_norm = np.sqrt(N_old_x * N_old_x + N_old_y * N_old_y)
+                if n_old_norm > 0:
+                    N_old_x /= n_old_norm
+                    N_old_y /= n_old_norm
+
+            if np.abs(uz) > 0.999999:
+                N_new_x, N_new_y, N_new_z = 0.0, 1.0, 0.0
+            else:
+                N_new_x = uy
+                N_new_y = -ux
+                N_new_z = 0.0
+                n_new_norm = np.sqrt(N_new_x * N_new_x + N_new_y * N_new_y)
+                if n_new_norm > 0:
+                    N_new_x /= n_new_norm
+                    N_new_y /= n_new_norm
+
+            cos_i = N_old_x * N_new_x + N_old_y * N_new_y + N_old_z * N_new_z
+            cross_x = N_old_y * N_new_z - N_old_z * N_new_y
+            cross_y = N_old_z * N_new_x - N_old_x * N_new_z
+            cross_z = N_old_x * N_new_y - N_old_y * N_new_x
+            sin_i = cross_x * ux + cross_y * uy + cross_z * uz
+            i = np.arctan2(sin_i, cos_i)
+            stokes = rotate_stokes_numba(stokes, -i)
+
+    return (total_collisions, absorbed_count, back_count, trans_count,
+            total_back_I, total_back_Q, total_back_U, total_back_V)
+
+
+def build_detector_cone(axis="forward", half_angle_deg=90.0, n_polar=2, n_azimuth=6):
+    half_angle = np.deg2rad(np.clip(float(half_angle_deg), 0.1, 90.0))
+    mu_min = np.cos(half_angle)
+    dirs = []
+    weights = []
+    n_polar = max(int(n_polar), 1)
+    n_azimuth = max(int(n_azimuth), 1)
+    for it in range(n_polar):
+        mu_hi = 1.0 - it * (1.0 - mu_min) / n_polar
+        mu_lo = 1.0 - (it + 1) * (1.0 - mu_min) / n_polar
+        mu_mid = 0.5 * (mu_hi + mu_lo)
+        theta = np.arccos(np.clip(mu_mid, -1.0, 1.0))
+        ring_weight = 2.0 * np.pi * (mu_hi - mu_lo)
+        for ip in range(n_azimuth):
+            phi = 2.0 * np.pi * (ip + 0.5) / n_azimuth
+            sx = np.sin(theta) * np.cos(phi)
+            sy = np.sin(theta) * np.sin(phi)
+            sz = np.cos(theta) if axis == "forward" else -np.cos(theta)
+            dirs.append((sx, sy, sz))
+            weights.append(ring_weight / n_azimuth)
+    weights_arr = np.asarray(weights, dtype=np.float64)
+    total = float(np.sum(weights_arr))
+    if total > 0:
+        weights_arr /= total
+    return np.asarray(dirs, dtype=np.float64), weights_arr
+
+
+def build_centered_z_edges(thickness, nz):
+    if nz <= 1:
+        return np.asarray([0.0, float(thickness)], dtype=np.float64)
+    centers = np.linspace(0.0, float(thickness), int(nz), dtype=np.float64)
+    edges = np.empty(int(nz) + 1, dtype=np.float64)
+    edges[0] = 0.0
+    edges[-1] = float(thickness)
+    edges[1:-1] = 0.5 * (centers[:-1] + centers[1:])
+    return edges
+
+
+def build_z_slab_majorants(density_grid, z_edges, layer_boundaries, layer_betas):
+    density = np.asarray(density_grid, dtype=np.float64)
+    nz = density.shape[2]
+    slab_betas = np.zeros(nz, dtype=np.float64)
+    bounds = np.asarray(layer_boundaries, dtype=np.float64)
+    betas = np.asarray(layer_betas, dtype=np.float64)
+    for iz in range(nz):
+        density_max = float(np.max(density[:, :, iz]))
+        if density_max <= 0.0:
+            continue
+        lo = float(z_edges[iz])
+        hi = float(z_edges[iz + 1])
+        beta_max = 0.0
+        for li, beta in enumerate(betas):
+            layer_lo = float(bounds[li])
+            layer_hi = float(bounds[li + 1])
+            if hi >= layer_lo and lo <= layer_hi:
+                beta_max = max(beta_max, float(beta))
+        slab_betas[iz] = density_max * beta_max
+    return slab_betas
+
+
 def run_advanced_simulation(
     layers_config, frequency_thz=300, incident_angle_deg=0.0, photons=100000,
     density_grid=None, grid_res_m=10.0,
     source_type="point", source_width_m=0.0,
     record_spatial=False, spatial_res_m=10.0, record_back_hist=False,
     m_real=1.33, m_imag=0.0, angstrom_q=1.3,
-    sigma_ln=0.35
+    sigma_ln=0.35, collect_voxel_fields=False,
+    field_forward_half_angle_deg=90.0, field_back_half_angle_deg=90.0,
+    field_quadrature_polar=2, field_quadrature_azimuth=6
 ):
     """
     高级蒙特卡洛仿真的高层接口，支持：
@@ -680,19 +1196,32 @@ def run_advanced_simulation(
     nb_gd = np.zeros((1, 1, 1))
     nb_go = np.zeros(3)
     nb_gs = np.zeros(3)
+    nb_z_edges = np.asarray([0.0, 1.0], dtype=np.float64)
+    nb_slab_betas = np.asarray([0.0], dtype=np.float64)
+    slab_eps = 0.0
     beta_max = np.max(nb_betas)
 
     if density_grid is not None:
         use_grid = True
         nb_gd = np.ascontiguousarray(density_grid, dtype=np.float64)
         nx, ny, nz = density_grid.shape
-        # 假设密度网格在 z 方向与层边界对齐，步长 = 总厚度 / nz
         total_thickness = layer_boundaries[-1]
-        nb_gs = np.array([grid_res_m, grid_res_m, total_thickness / nz], dtype=np.float64)
-        nb_go = np.array([-grid_res_m * nx / 2, -grid_res_m * ny / 2, 0.0], dtype=np.float64)
+        z_step = total_thickness / max(nz - 1, 1)
+        nb_gs = np.array([grid_res_m, grid_res_m, z_step], dtype=np.float64)
+        nb_go = np.array([
+            -0.5 * grid_res_m * max(nx - 1, 0),
+            -0.5 * grid_res_m * max(ny - 1, 0),
+            0.0
+        ], dtype=np.float64)
         density_max = np.max(density_grid)
         if density_max > 0:
             beta_max *= density_max   # 全局最大消光系数需覆盖调制后的最大值
+        nb_z_edges = build_centered_z_edges(total_thickness, nz)
+        nb_slab_betas = build_z_slab_majorants(nb_gd, nb_z_edges, nb_bounds, nb_betas)
+        slab_eps = max(z_step * 1e-6, 1e-9)
+        slab_beta_max = float(np.max(nb_slab_betas))
+        if slab_beta_max > 0:
+            beta_max = slab_beta_max
 
     # 快速返回：若密度网格全零且启用，介质透明
     if use_grid and np.max(nb_gd) == 0:
@@ -704,6 +1233,20 @@ def run_advanced_simulation(
         depol_back_eff = depol_back_weighted_sum / layer_weight_sum if layer_weight_sum > 1e-30 else 0.0
         depol_forward_eff = depol_forward_weighted_sum / layer_weight_sum if layer_weight_sum > 1e-30 else 0.0
         fb_ratio_eff = beta_forward_eff / beta_back_eff if beta_back_eff > 1e-30 else 0.0
+        arrays = {"mc_back_dist": [0]*900, "spatial_grid": np.zeros((1,1))}
+        if collect_voxel_fields:
+            zero_fields = np.zeros_like(nb_gd, dtype=np.float64)
+            arrays["voxel_fields"] = {
+                "forward_I": zero_fields.copy(),
+                "forward_Q": zero_fields.copy(),
+                "forward_U": zero_fields.copy(),
+                "forward_V": zero_fields.copy(),
+                "back_I": zero_fields.copy(),
+                "back_Q": zero_fields.copy(),
+                "back_U": zero_fields.copy(),
+                "back_V": zero_fields.copy(),
+                "event_count": zero_fields.copy(),
+            }
         return {
             "scalars": {
                 "R_back": 0.0,
@@ -720,7 +1263,7 @@ def run_advanced_simulation(
                 "depol_back": depol_back_eff,
                 "depol_forward": depol_forward_eff,
             },
-            "arrays": {"mc_back_dist": [0]*900, "spatial_grid": np.zeros((1,1))}
+            "arrays": arrays
         }
 
     # ---------- 4. 空间记录网格（后向散射强度分布）----------
@@ -737,7 +1280,6 @@ def run_advanced_simulation(
     st_code = 1 if source_type == "planar" else 0
 
     # ---------- 5. 分批运行内核 ----------
-    BATCH_SIZE = 1000
     total_photons = int(photons)
 
     acc_tc = 0
@@ -753,18 +1295,61 @@ def run_advanced_simulation(
     t0 = time.time()
     processed = 0
 
-    print(f">> [计算中] 开始仿真: 共 {total_photons} 光子, 分组大小: {BATCH_SIZE}", flush=True)
+    use_exact_kernel = bool(collect_voxel_fields and use_grid)
+    use_fast_kernel = (not use_exact_kernel) and (not record_spatial) and (not record_back_hist)
+    BATCH_SIZE = 8192 if (use_exact_kernel or use_fast_kernel) else 1000
 
-    use_fast_kernel = (not record_spatial) and (not record_back_hist)
+    print(f">> [计算中] 开始仿真: 共 {total_photons} 光子, 分组大小: {BATCH_SIZE}", flush=True)
+    if use_exact_kernel:
+        forward_dirs, forward_weights = build_detector_cone(
+            "forward", field_forward_half_angle_deg,
+            field_quadrature_polar, field_quadrature_azimuth
+        )
+        back_dirs, back_weights = build_detector_cone(
+            "back", field_back_half_angle_deg,
+            field_quadrature_polar, field_quadrature_azimuth
+        )
+        exact_forward_I = np.zeros_like(nb_gd, dtype=np.float64)
+        exact_forward_Q = np.zeros_like(nb_gd, dtype=np.float64)
+        exact_forward_U = np.zeros_like(nb_gd, dtype=np.float64)
+        exact_forward_V = np.zeros_like(nb_gd, dtype=np.float64)
+        exact_back_I = np.zeros_like(nb_gd, dtype=np.float64)
+        exact_back_Q = np.zeros_like(nb_gd, dtype=np.float64)
+        exact_back_U = np.zeros_like(nb_gd, dtype=np.float64)
+        exact_back_V = np.zeros_like(nb_gd, dtype=np.float64)
+        exact_event_count = np.zeros_like(nb_gd, dtype=np.float64)
+    else:
+        forward_dirs = np.zeros((1, 3), dtype=np.float64)
+        forward_weights = np.ones(1, dtype=np.float64)
+        back_dirs = np.zeros((1, 3), dtype=np.float64)
+        back_weights = np.ones(1, dtype=np.float64)
+        exact_forward_I = exact_forward_Q = exact_forward_U = exact_forward_V = None
+        exact_back_I = exact_back_Q = exact_back_U = exact_back_V = None
+        exact_event_count = None
 
     while processed < total_photons:
         current_batch = min(BATCH_SIZE, total_photons - processed)
-        if use_fast_kernel:
+        if use_exact_kernel:
+            res = mc_kernel_advanced_exact(
+                current_batch, nb_bounds, nb_betas, nb_omegas, nb_mie_ids, float(beta_max),
+                np.deg2rad(incident_angle_deg),
+                st_code, float(source_width_m), float(source_width_m),
+                use_grid, nb_gd, nb_go, nb_gs,
+                nb_z_edges, nb_slab_betas, float(slab_eps),
+                theta_rad_grid, cdf_all, base_mie.angles_deg, mie_tabs,
+                forward_dirs, forward_weights, back_dirs, back_weights,
+                exact_forward_I, exact_forward_Q, exact_forward_U, exact_forward_V,
+                exact_back_I, exact_back_Q, exact_back_U, exact_back_V, exact_event_count
+            )
+            tc, ac, bc, trc, b_I, b_Q, b_U, b_V = res
+            ab = None
+        elif use_fast_kernel:
             res = mc_kernel_advanced_fast(
                 current_batch, nb_bounds, nb_betas, nb_omegas, nb_mie_ids, float(beta_max),
                 np.deg2rad(incident_angle_deg),
                 st_code, float(source_width_m), float(source_width_m),
                 use_grid, nb_gd, nb_go, nb_gs,
+                nb_z_edges, nb_slab_betas, float(slab_eps),
                 theta_rad_grid, cdf_all, base_mie.angles_deg, mie_tabs
             )
             tc, ac, bc, trc, b_I, b_Q, b_U, b_V = res
@@ -815,6 +1400,24 @@ def run_advanced_simulation(
 
     print(f">> [完成] 耗时: {dt:.4f}s | 速度: {total_photons/dt/1e6:.2f} M/s", flush=True)
 
+    arrays = {
+        "mc_back_dist": acc_ab.tolist() if record_back_hist else [],
+        "spatial_grid": spatial_grid
+    }
+    if use_exact_kernel:
+        inv_n = 1.0 / ns
+        arrays["voxel_fields"] = {
+            "forward_I": exact_forward_I * inv_n,
+            "forward_Q": exact_forward_Q * inv_n,
+            "forward_U": exact_forward_U * inv_n,
+            "forward_V": exact_forward_V * inv_n,
+            "back_I": exact_back_I * inv_n,
+            "back_Q": exact_back_Q * inv_n,
+            "back_U": exact_back_U * inv_n,
+            "back_V": exact_back_V * inv_n,
+            "event_count": exact_event_count,
+        }
+
     return {
         "scalars": {
             "R_back": acc_bc / ns,
@@ -831,8 +1434,5 @@ def run_advanced_simulation(
             "depol_back": depol_back_eff,
             "depol_forward": depol_forward_eff,
         },
-        "arrays": {
-            "mc_back_dist": acc_ab.tolist() if record_back_hist else [],
-            "spatial_grid": spatial_grid
-        }
+        "arrays": arrays
     }
