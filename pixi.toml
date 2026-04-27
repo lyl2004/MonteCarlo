@@ -1,0 +1,61 @@
+[workspace]
+name = "MonteCarlo"
+version = "0.1.0"
+authors = ["syp"]
+channels = ["conda-forge"]
+platforms = ["win-64"]
+
+# ========================================================
+# 1. 特性 (Features) 定义
+# ========================================================
+
+# --- GUI 前端基础 ---
+[feature.gui_base.dependencies]
+python = "3.11.*"
+pip = "*"
+nicegui = ">=3.6.1,<4"
+
+[feature.gui_base.pypi-dependencies]
+pywebview = ">=6.1, <7"
+
+# --- MIE 现代计算核心 ---
+[feature.mie_core.dependencies]
+python = "3.11.*"
+pip = "*"
+numpy = ">=2.3.5,<3"
+scipy = ">=1.17.0,<2"
+numba = ">=0.63.1,<0.64"
+pyvista = ">=0.46.4,<0.47"
+trame = "*"
+trame-vtk = "*"
+trame-vuetify = "*"
+nest-asyncio = "*"
+panel = ">=1.8.7,<2"
+
+
+[feature.mie_core.pypi-dependencies]
+pymiescatt = "*"
+
+# --- Julia 通讯与调度中枢 ---
+[feature.julia_core.dependencies]
+python = "3.11.*"
+pip = "*"
+numpy = ">=2.3.5,<3"       # 用于读写 .npz / .npy 文件，实现与 Julia 的硬盘数据交换
+pyvista = ">=0.46.4,<0.47" # 保持与 mie_core 版本一致，用于将 Julia 数据渲染为同源 HTML
+trame = "*"                # PyVista 导出交互式 HTML 所需的基础依赖
+trame-vtk = "*"            # PyVista VTK Web 渲染依赖
+httpx = "*"                # 预留：用于后续可能的 HTTP 服务器模式通讯
+
+[feature.julia_core.pypi-dependencies]
+juliacall = "*"            # 预留：如果你仍需要进行简单的进程内 Python-Julia 调用映射
+
+# ========================================================
+# 2. 环境 (Environments) 定义
+# ========================================================
+
+[environments]
+gui = ["gui_base"]
+mie = ["mie_core"]
+julia = ["julia_core"]     # 新增的专属调度环境
+
+default = ["gui_base"]
