@@ -9,12 +9,12 @@
   - 面向 `sphere / cylinder / spheroid`。
   - 适合非球形粒子、solver 诊断和更严格的散射物理分析。
 
-当前日期状态：`2026-04-27`。
+当前日期状态：`2026-04-29`。
 
 ## 当前状态
 
 - GUI 已支持 `mie` 和 `iitm` 两个后端切换。
-- 两套后端均导出同构数据包：`density.npz + render_main.html + render_top.html + render_front.html`。
+- 两套后端均导出同构数据包：`density.npz + render_main.html + render_front.html + render_top.html + render_right.html`。
 - 两套后端均支持场族：
   - `proxy`：代理场，用于快速预览、参数扫描和工程诊断。
   - `exact`：detector-conditioned response field，由 Monte Carlo 散射事件处的探测锥响应累积得到。
@@ -28,6 +28,31 @@
   - `requested_field_compute_mode`
   - `effective_field_compute_mode`
   - `primary_field_family`
+- GUI 会从后端返回的 `field_catalog` 或现有 `density.npz` 中恢复 `proxy/exact` 字段目录；切换项目后仍可选择精确场。
+- 字段切换优先通过 iframe `postMessage` 完成，避免频繁销毁 Plotly/WebGL 上下文；切换视图文件时才重新加载 iframe。
+
+## 内置仿真情景
+
+旧样例已清理，当前主项目内置 8 个可运行配置，见 `inputs/SCENARIOS.md`。
+
+| 后端 | 环境 | 配置 |
+| --- | --- | --- |
+| Mie | 雾 | `inputs/mie/pdf_fog_radiation.json` |
+| Mie | 霾 | `inputs/mie/pdf_haze_dust.json` |
+| Mie | 雨 | `inputs/mie/pdf_rain_moderate.json` |
+| Mie | 快速展示 | `inputs/mie/quick_display.json` |
+| IITM | 雾 | `inputs/iitm/pdf_fog_radiation.json` |
+| IITM | 霾 | `inputs/iitm/pdf_haze_dust.json` |
+| IITM | 雨 | `inputs/iitm/pdf_rain_moderate.json` |
+| IITM | 快速展示 | `inputs/iitm/quick_display.json` |
+
+共同约束：
+
+- 完整情景按 `temp/计算流程.pdf` 的雨/雾/霾设定组织，波长为 `1550 nm`，名义探测距离为 `1-2000 m`。
+- 完整情景距离门宽度为 `10 m`，接收重叠因子在 `200 m` 达到全重叠。
+- Mie 情景使用点源入射，以便与 IITM/T-Matrix 的点源 Monte Carlo 结果可比。
+- GUI 预览配置默认使用 `preview_max_grid=48`，请求预览时传递 `max_grid=48`，降低 WebView/Plotly 内存压力。
+- 完整 Marshall-Palmer 雨滴积分仍以 `temp/lidar_1d` 为物理参考；主项目 3D 后端中的雨情景使用可运行、可预览的水滴代理配置。
 
 ## 后端能力矩阵
 
@@ -60,7 +85,10 @@ MonteCarlo/
 ├─ log/
 ├─ tests/
 │  ├─ test_mie_contracts.py
+│  ├─ test_mie_lidar_observation.py
+│  ├─ test_dataset_contract.py
 │  ├─ julia_field_contract.jl
+│  ├─ julia_lidar_contract.jl
 │  └─ julia_server_contract.jl
 ├─ src/
 │  ├─ gui.py
@@ -114,7 +142,7 @@ GUI 主文件是 `src/gui.py`。
 入口：
 
 ```powershell
-pixi run -e mie python -u src/mie_worker.py --project_name test1 --config "{...}" --cpu_limit 4
+pixi run -e mie python -u src/mie_worker.py --project_name quick_display --config (Get-Content inputs/mie/quick_display.json -Raw) --cpu_limit 4
 ```
 
 ### 1. 配置与目录
@@ -374,7 +402,7 @@ solver diagnostics 包括：
 1. `build_field_bundle()` 生成 `proxy` 和/或 `exact` family。
 2. `build_field_catalog()` 生成 GUI 字段目录。
 3. `save_field_npz()` 保存 `density.npz`。
-4. `render_to_html()` 生成 3 个 HTML。
+4. `render_to_html()` 生成四视图 HTML：主视、前视、顶视、右视。
 
 ## 文件输出协议
 
@@ -388,8 +416,9 @@ solver diagnostics 包括：
 ```text
 density.npz
 render_main.html
-render_top.html
 render_front.html
+render_top.html
+render_right.html
 ```
 
 `density.npz` 常用键：
@@ -408,6 +437,13 @@ render_front.html
 | `exact_depol_ratio` | exact 退偏场 |
 | `exact_event_count` | exact voxel 采样次数 |
 | `exact_summary` | exact 汇总 |
+| `range_bins_m` | 距离门坐标 |
+| `echo_I/Q/U/V` | 距离门 Stokes 通道 |
+| `echo_power` | 距离门回波强度 |
+| `echo_depol` | 距离门退偏比 |
+| `echo_event_count` | 每个距离门采样事件数 |
+| `echo_weight_sum` | 每个距离门权重和 |
+| `echo_relative_error_est` | 距离门相对误差估计 |
 | `beta_back` | primary family legacy alias |
 | `beta_forward` | primary family legacy alias |
 | `depol_ratio` | primary family legacy alias |
@@ -418,18 +454,21 @@ render_front.html
 两套后端当前渲染方式同构。
 
 1. 后端写 `density.npz`。
-2. 后端写三份 HTML，每份只包含轻量 JS 模板和默认 camera。
+2. 后端写四份 HTML，每份只包含轻量 JS 模板和默认 camera。
 3. HTML 加载：
    - JSZip
    - Plotly
    - 内置 `.npy` parser
 4. 浏览器执行 `fetch('./density.npz?t=...')`。
-5. JS 从 NPZ 中读取 `density / axis / field arrays`。
+5. JS 从 NPZ 中读取 `density / axis / field_catalog`，并按当前 `family + field` 选择实际渲染数组。
 6. 根据 `field_catalog` 生成字段按钮。
 7. 使用 Plotly `volume` trace 渲染。
-8. GUI iframe 通过 query 或 `postMessage` 切换：
+8. GUI iframe 通过 query 初始化，通过 `postMessage` 切换：
    - `family=proxy|exact`
    - `field=beta_back|beta_forward|depol_ratio|density|event_count`
+   - `view=main|front|top|right`
+
+字段切换不重新创建 iframe，优先复用当前 Plotly/WebGL 上下文；只有视图文件变化时才重新加载对应 HTML。GUI 在切换项目后会从 worker 返回值或已存在的 `density.npz` 恢复 `proxy/exact` 字段目录，避免 exact 按钮丢失。
 
 渲染成本随 `grid_dim^3 * 字段数` 增长。`grid_dim=120` 时，单个 Float32 三维场约 `6.9 MB`，多个 proxy/exact 字段会显著增加浏览器内存和 NPZ 大小。
 
@@ -458,6 +497,12 @@ render_front.html
 | `field_back_half_angle_deg` | 支持 | 支持 | exact 后向探测锥半角 |
 | `field_quadrature_polar` | 支持 | 支持 | 探测锥极角积分点 |
 | `field_quadrature_azimuth` | 支持 | 支持 | 探测锥方位积分点 |
+| `preview_max_grid` | 支持 | 支持 | GUI 预览降采样上限，默认建议 `48` |
+| `lidar_enabled` | 支持 | 支持 | 是否输出距离门激光雷达观测量 |
+| `range_bin_width_m` | 支持 | 支持 | 距离门宽度 |
+| `range_max_m` | 支持 | 支持 | 最大观测距离，`0` 时使用后端默认范围 |
+| `receiver_overlap_min` | 支持 | 支持 | 近场接收重叠因子下限 |
+| `receiver_overlap_full_range_m` | 支持 | 支持 | 接收重叠因子达到 1 的距离 |
 
 ### Mie 侧参数
 
@@ -466,6 +511,8 @@ render_front.html
 | `mie_layer_count` | 光学层数量 |
 | `mie_n_radii` | lognormal 粒径积分采样数 |
 | `forward_cone_deg` | proxy 前向参考 cone |
+| `source_type` | Monte Carlo 入射源，`point` 或 `planar` |
+| `source_width_m` | 平面源半宽；点源时可为 `0` |
 | `cpu_cores` / `--cpu_limit` | Numba/OMP 线程环境变量 |
 | `explode_dist` | 保留配置项，当前浏览器渲染不主要依赖 |
 
@@ -522,11 +569,12 @@ render_front.html
 
 `depol_ratio` 当前统一钳制在 `[0, 1]`。
 
-- proxy depol：来自 LUT 或散射参考量。
+- proxy depol：来自 LUT 或散射参考量。若场景只有单一均匀粒径谱/形状谱，且 LUT 不随高度、混合比例或微物理状态变化，proxy depol 出现常数是合理结果，不代表探测器响应退化。
 - exact depol：来自 voxel 累积 Stokes 分量：
   - `1 - sqrt(Q^2 + U^2 + V^2) / I`
+- echo depol：来自距离门 Stokes 通道，是后续反演数据库优先使用的观测量。
 
-两者来源不同，当前字段名相同但通过 family 区分。
+要让 proxy 退偏比具有空间变化，需要引入分层、双峰/混合粒径谱、形状混合、折射率变化或 range-varying microphysics；否则应优先使用 exact/echo depol 解释 MC 探测响应。两类三维场来源不同，当前字段名相同但通过 family 区分。
 
 ### `sigma_*_ref` 与 `beta_*_ref`
 
@@ -643,7 +691,7 @@ pixi run -e gui python src/gui.py
 Mie worker：
 
 ```powershell
-pixi run -e mie python -u src/mie_worker.py --project_name test1 --config "{...}" --cpu_limit 4
+pixi run -e mie python -u src/mie_worker.py --project_name quick_display --config (Get-Content inputs/mie/quick_display.json -Raw) --cpu_limit 4
 ```
 
 Julia server：
@@ -680,12 +728,177 @@ pixi run -e gui python -m py_compile src/gui.py src/iitm_http_worker.py src/iitm
 - 球形粒子关注探测器响应空间分布：使用 Mie exact 或 both。
 - 非球形粒子：使用 Julia/IITM。
 - 需要 solver 诊断：使用 Julia/IITM。
+- 需要与 IITM/T-Matrix 的空间图像做形态比较：Mie 使用 `source_type=point`，避免平面源把入射光束展宽为近似平面化结构。
 - exact 场定量分析必须同时报告：
   - photon 数
   - detector cone 半角
   - quadrature 设置
   - `event_count`
 - 高 `grid_dim` 或 `field_compute_mode=both` 会显著增加内存、NPZ 体积和浏览器渲染压力。
+- 频繁切换 GUI 预览时保守使用 `preview_max_grid=48`，并优先切换字段而非反复打开新项目窗口。
+- 三维场均提供 `main/front/top/right` 四个视图；回波曲线和反演样本协议以 `echo_*` 数组为准，不从 HTML 截图反推。
+
+## 【新增】面向激光雷达反演数据库的下一步工作（第一优先级）
+
+> 本节为新加入内容，目标是将当前主项目从“前向仿真与可视化平台”扩展为“可批量生成高可信反演样本的数据引擎”。
+> 适用范围：`Mie + Numba` 与 `Julia/IITM` 两条后端。
+
+### 目标声明（用于后续实现约束）
+
+当前项目后续迭代将明确服务于：
+
+- 建立激光雷达反演数据库（training/validation/test datasets）。
+- 数据库样本输出必须与观测量一致（距离门回波强度与偏振通道），而不仅是体素场或全局散射统计量。
+- 每条样本必须附带数值误差与配置元数据，保证可追溯和可复现实验。
+
+---
+
+### 第一优先级 P0（必须先完成）
+
+#### P0-1. 时间门控观测算子（Time-Gated Lidar Observation Operator）【最高优先级】
+
+当前 `exact/proxy` 体素结果不能直接等价为 PDF 所需 `P(R)` 曲线。需要新增“观测门函数+距离门累积”模块：
+
+1. 定义距离门/时间门：
+   - `R_i = i * ΔR`，`ΔR` 来自激光脉宽与采样设置。
+   - 对应飞行时间 `t_i = 2R_i/c`。
+2. 对每次散射贡献记录“到达探测器的总光程”，映射到 `R-bin`。
+3. 在每个 `R-bin` 累积 Stokes 通道：
+   - `I(R_i), Q(R_i), U(R_i), V(R_i)`。
+4. 从门控 Stokes 计算观测量：
+   - `P(R_i)`（功率或归一化功率）
+   - `δ(R_i)`（退偏比）
+   - 可选 `SNR(R_i)`。
+5. 接收器模型参数化：
+   - `overlap O(R)`
+   - `FOV`（前/后向探测锥）
+   - 噪声底与门宽。
+
+**建议新增输出（非绘图）**：
+
+- `arrays.range_bins_m`
+- `arrays.echo_I, echo_Q, echo_U, echo_V`
+- `arrays.echo_power`
+- `arrays.echo_depol`
+- `meta.receiver_model`（门宽/FOV/overlap/noise 等）
+
+**当前实现状态（2026-04-29 迭代）**：
+
+- Mie/Numba 与 Julia/IITM 已接入同构距离门观测输出。
+- 输出字段保存到 `density.npz`：
+  - `range_bins_m`
+  - `echo_I / echo_Q / echo_U / echo_V`
+  - `echo_power`
+  - `echo_depol`
+  - `echo_event_count`
+  - `echo_weight_sum`
+  - `echo_relative_error_est`
+- 当前 `echo_*` 来源为 accepted scattering event 的 detector-cone backscatter response：
+  - 距离门映射使用 `R = (path_length_to_event + escape_path_to_receiver) / 2`。
+  - receiver overlap 当前使用简化线性模型。
+- Mie 批量数据集 runner 已支持单样本协议：
+  - `observation.npz`
+  - `truth.json`
+  - `receiver.json`
+  - `quality.json`
+  - `run_config.json`
+
+**验收标准**：
+
+- 在均匀介质下，门控 `P(R)` 与解析雷达方程趋势一致。
+- 在非理想重叠设置下，近场抑制行为符合输入 `O(R)`。
+- `δ(R)` 不再被迫为常数，且与场景参数变化一致。
+
+#### P0-2. 反演数据库样本协议（Dataset Contract）
+
+建立统一样本协议，确保后续训练与验证可复用：
+
+- 输入标签（truth）：
+  - 介质参数（粒径谱、形状谱、折射率、浓度、空间分布参数）
+  - 仪器参数（波长、门宽、FOV、重叠、噪声）
+- 输出观测（features）：
+  - `P(R)`、`δ(R)`、可选多通道偏振信号
+- 质量元数据：
+  - 光子数、角分辨、积分节点数、收敛诊断、随机种子、代码版本 hash。
+
+**验收标准**：
+
+- 任意样本可通过元数据完整复算。
+- 不同后端（Mie / IITM）可输出同构观测字段。
+
+---
+
+### 第二优先级 P1（完成 P0 后推进）
+
+#### P1-1. 逐体素微物理参数兼容（高自由度场）
+
+在保留当前 `density_grid` 的基础上，扩展到可输入：
+
+- `voxel_mie_id_grid`（每体素散射类型索引）
+- 或分块参数场（比完全逐体素更稳健）：
+  - `N0(x,y,z), r_med(x,y,z), sigma_ln(x,y,z), shape(x,y,z), axis_ratio(x,y,z), m(x,y,z)`
+
+建议采用“两级策略”：
+
+1. 先支持分块（tile/chunk）参数场；
+2. 再支持完整逐体素自由度。
+
+**原因**：兼顾可行性（内存/计算）与物理表达能力。
+
+#### P1-2. 粒径与形状谱求解器分层
+
+为不同场景提供分层精度档：
+
+- 快速档：lognormal + 低阶角分辨
+- 标准档：lognormal/bimodal + 中高角分辨
+- 高精档：非球形 + 高阶 T-matrix 半径求积 + 收敛检查
+
+并将档位与误差阈值绑定（不是只给参数，不给通过标准）。
+
+---
+
+### 第三优先级 P2（数据库规模化与可信度增强）
+
+#### P2-1. 收敛与不确定度体系（必须随样本输出）
+
+每条样本输出至少三类误差指标：
+
+1. 粒径积分误差（例如 n 与 n/2 对比）
+2. 角分辨误差（角网格加密前后对比）
+3. MC 统计误差（按 bin 的方差/置信区间）
+
+#### P2-2. 场景采样设计（避免数据库偏置）
+
+采用分层采样/LHS 方案覆盖：
+
+- 雾/霾/雨多场景
+- 能见度、粒径谱参数、非球形比例、湿增长参数
+- 仪器参数扰动（FOV、overlap、噪声）
+
+避免“只在少数参数区域高密采样”，导致反演模型泛化差。
+
+#### P2-3. 基准与域校准
+
+增加与解析/文献/高保真参考的交叉校准流程：
+
+- Rayleigh / 单散射极限
+- 典型雾霾雨工况的经验区间
+- 不同后端同场景一致性检查（Mie vs IITM 在可比条件下）
+
+---
+
+### 实施顺序建议（可直接执行）
+
+1. 先做 `P0-1` 时间门控观测算子（核心瓶颈，第一优先级）。
+2. 同步落地 `P0-2` 样本协议（避免后续返工）。
+3. 再做 `P1-1` 分块/逐体素微物理自由度扩展。
+4. 最后推进 `P1-2`、`P2-*` 做规模化与可信度闭环。
+
+### 风险与边界
+
+- 若跳过 `P0-1`，则数据库“标签-观测一致性”不足，不建议直接用于反演训练。
+- 若只做逐体素参数、不做误差输出，数据库可用性会受限（难以筛选低质量样本）。
+- 若仅增加样本数量、不做场景采样设计，反演模型容易发生参数域偏置。
 
 ## 仓库协作约定
 

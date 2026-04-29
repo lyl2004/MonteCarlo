@@ -84,7 +84,13 @@ DEFAULT_CONFIG = {
     'r_bottom': 2.0, 'r_top': 12.0, 'sigma_ln': 0.35,
     'cloud_center_z': 10.0, 'cloud_thickness': 8.0, 'turbulence_scale': 4.0,
     'photons': 50000, 'visibility_km': 3.0, 'explode_dist': 0.7,
+    'source_type': 'planar', 'source_width_m': 0.0,
     'field_compute_mode': 'proxy_only',
+    'lidar_enabled': False,
+    'range_bin_width_m': 1.0,
+    'range_max_m': 0.0,
+    'receiver_overlap_min': 1.0,
+    'receiver_overlap_full_range_m': 0.0,
 }
 
 
@@ -430,6 +436,28 @@ def attach_exact_fields(data, sim_res):
     return True
 
 
+def attach_lidar_observation(data, sim_res):
+    obs = sim_res.get("arrays", {}).get("lidar_observation")
+    if not obs:
+        return False
+    keys = [
+        "range_bins_m",
+        "echo_I",
+        "echo_Q",
+        "echo_U",
+        "echo_V",
+        "echo_power",
+        "echo_depol",
+        "echo_event_count",
+        "echo_weight_sum",
+        "echo_relative_error_est",
+    ]
+    lidar = {name: np.asarray(obs[name], dtype=np.float64) for name in keys if name in obs}
+    lidar["receiver_model"] = dict(obs.get("receiver_model", {}))
+    data["lidar_observation"] = lidar
+    return True
+
+
 def save_field_npz(data, output_dir: Path):
     output_dir.mkdir(parents=True, exist_ok=True)
     density = np.asfortranarray(np.asarray(data['density_norm'], dtype=np.float32))
@@ -504,6 +532,23 @@ def save_field_npz(data, output_dir: Path):
     elif exact_arrays is not None:
         arrays["event_count"] = exact_arrays["event_count"]
 
+    if "lidar_observation" in data:
+        lidar = data["lidar_observation"]
+        receiver_model_json = json.dumps(lidar.get("receiver_model", {}), ensure_ascii=False)
+        arrays.update({
+            "range_bins_m": np.asarray(lidar["range_bins_m"], dtype=np.float32),
+            "echo_I": np.asarray(lidar["echo_I"], dtype=np.float32),
+            "echo_Q": np.asarray(lidar["echo_Q"], dtype=np.float32),
+            "echo_U": np.asarray(lidar["echo_U"], dtype=np.float32),
+            "echo_V": np.asarray(lidar["echo_V"], dtype=np.float32),
+            "echo_power": np.asarray(lidar["echo_power"], dtype=np.float32),
+            "echo_depol": np.asarray(lidar["echo_depol"], dtype=np.float32),
+            "echo_event_count": np.asarray(lidar["echo_event_count"], dtype=np.float32),
+            "echo_weight_sum": np.asarray(lidar["echo_weight_sum"], dtype=np.float32),
+            "echo_relative_error_est": np.asarray(lidar["echo_relative_error_est"], dtype=np.float32),
+            "receiver_model_json": np.asarray(receiver_model_json),
+        })
+
     npz_path = output_dir / "density.npz"
     np.savez_compressed(npz_path, **arrays)
     return npz_path
@@ -543,6 +588,7 @@ const EMBED_MODE = URL_PARAMS.get('embed') === '1';
 const START_FAMILY = URL_PARAMS.get('family') || 'proxy';
 const START_FIELD = URL_PARAMS.get('field') || 'beta_back';
 const DATA_VERSION = URL_PARAMS.get('t') || String(Date.now());
+const MAX_PREVIEW_GRID = Math.max(16, parseInt(URL_PARAMS.get('max_grid') || '64', 10));
 const FIELD_CATALOG = {field_catalog_json};
 if (EMBED_MODE) document.body.classList.add('embed');
 
@@ -585,22 +631,27 @@ async function loadAndRender() {{
       const file = zip.file(name + '.npy');
       return file ? parseNpy(await file.async('arraybuffer')) : null;
     }}
-    const densObj = await readArray('density');
     const axisObj = await readArray('axis');
     const summaryObj = await readArray('summary');
-    const N = densObj.shape[0];
     const axis = axisObj.data;
-    const total = N * N * N;
+    const N = axis.length;
+    const stride = Math.max(1, Math.ceil(N / MAX_PREVIEW_GRID));
+    const previewN = Math.ceil(N / stride);
+    const total = previewN * previewN * previewN;
     const xs = new Float32Array(total), ys = new Float32Array(total), zs = new Float32Array(total);
+    const previewFlatIndices = new Int32Array(total);
     let idx = 0;
-    for (let iz = 0; iz < N; iz++) for (let iy = 0; iy < N; iy++) for (let ix = 0; ix < N; ix++) {{
+    for (let iz = 0; iz < N; iz += stride) for (let iy = 0; iy < N; iy += stride) for (let ix = 0; ix < N; ix += stride) {{
       xs[idx] = axis[ix]; ys[idx] = axis[iy]; zs[idx] = axis[iz]; idx++;
+      previewFlatIndices[idx - 1] = ix + N * (iy + N * iz);
     }}
-    function colorscaleFor(fieldName) {{
+    function colorscaleFor(fieldName, familyName) {{
+      if (fieldName === 'beta_back') return familyName === 'exact' ? 'Turbo' : 'Hot';
       if (fieldName === 'beta_forward') return 'Viridis';
       if (fieldName === 'depol_ratio') return 'Cividis';
-      if (fieldName === 'density') return 'Hot';
-      return 'Hot';
+      if (fieldName === 'density') return 'Blues';
+      if (fieldName === 'event_count') return 'Blues';
+      return familyName === 'exact' ? 'Turbo' : 'Hot';
     }}
     const fieldDefs = {{}};
     const familySummaries = {{}};
@@ -610,16 +661,30 @@ async function loadAndRender() {{
       familySummaries[familyName] = familySummaryObj ? familySummaryObj.data : summaryObj.data;
       for (const entry of entries) {{
         const storageName = entry.name === 'density' ? 'density' : (entry.storage || (familyName + '_' + entry.name));
-        const valuesObj = entry.name === 'density' ? densObj : await readArray(storageName);
         fieldDefs[familyName][entry.name] = {{
           label: entry.label || entry.name,
-          values: valuesObj.data,
-          colorscale: colorscaleFor(entry.name),
+          storage: storageName,
+          values: null,
+          colorscale: colorscaleFor(entry.name, familyName),
           opacity: entry.name === 'depol_ratio' ? 0.18 : 0.12,
         }};
       }}
     }}
-    function fieldRange(values, fieldName) {{
+    async function loadFieldValues(def) {{
+      if (def.values) return def.values;
+      loading.style.display = 'block';
+      loading.textContent = '正在加载字段...';
+      const valuesObj = await readArray(def.storage);
+      if (stride === 1) {{
+        def.values = valuesObj.data;
+      }} else {{
+        const sampled = new Float32Array(total);
+        for (let i = 0; i < total; i++) sampled[i] = valuesObj.data[previewFlatIndices[i]];
+        def.values = sampled;
+      }}
+      return def.values;
+    }}
+    function fieldRange(values, fieldName, familyName) {{
       let vmin = Infinity, vmax = -Infinity;
       for (let i = 0; i < values.length; i++) {{
         const v = values[i];
@@ -630,11 +695,15 @@ async function loadAndRender() {{
       if (!Number.isFinite(vmin) || !Number.isFinite(vmax)) return {{isomin: 0, isomax: 1}};
       if (fieldName === 'depol_ratio') return Math.abs(vmax - vmin) < Number.EPSILON ? {{isomin: Math.max(vmin - 1e-3, 0), isomax: vmin + 1e-3}} : {{isomin: Math.max(vmin, 0), isomax: vmax}};
       if (vmax <= 0) return {{isomin: 0, isomax: 1}};
-      return {{isomin: Math.max(vmax * 0.05, Number.EPSILON), isomax: vmax}};
+      let thresholdRatio = 0.05;
+      if (familyName === 'exact') {{
+        thresholdRatio = fieldName === 'event_count' ? 0.00025 : 0.0005;
+      }}
+      return {{isomin: Math.max(vmax * thresholdRatio, Number.EPSILON), isomax: vmax}};
     }}
     function makeTrace(familyName, fieldName) {{
       const def = fieldDefs[familyName][fieldName];
-      const range = fieldRange(def.values, fieldName);
+      const range = fieldRange(def.values, fieldName, familyName);
       return {{
         type: 'volume', x: xs, y: ys, z: zs, value: def.values,
         isomin: range.isomin, isomax: range.isomax,
@@ -669,12 +738,16 @@ async function loadAndRender() {{
     async function renderField(familyName, fieldName) {{
       if (!fieldDefs[familyName] || !fieldDefs[familyName][fieldName]) return;
       currentFamily = familyName; currentField = fieldName;
+      loading.style.display = 'block';
       const nextUrl = new URL(window.location.href);
       nextUrl.searchParams.set('family', currentFamily);
       nextUrl.searchParams.set('field', currentField);
       window.history.replaceState(null, '', nextUrl.toString());
       updateInfo(); setActiveButton();
+      await loadFieldValues(fieldDefs[currentFamily][currentField]);
+      plotDiv.style.display = 'block';
       await Plotly.react('plot', [makeTrace(familyName, fieldName)], layout, {{responsive: true, displaylogo: false, displayModeBar: !EMBED_MODE, scrollZoom: false, modeBarButtonsToRemove: ['toImage']}});
+      loading.style.display = 'none';
     }}
     if (!EMBED_MODE) {{
       for (const [familyName, fields] of Object.entries(fieldDefs)) for (const [fieldName, def] of Object.entries(fields)) {{
@@ -685,7 +758,6 @@ async function loadAndRender() {{
         toolbar.appendChild(btn);
       }}
     }}
-    plotDiv.style.display = 'block';
     window.addEventListener('message', async (event) => {{
       const data = event && event.data ? event.data : null;
       if (!data || data.type !== 'iitm:set_field') return;
@@ -693,7 +765,6 @@ async function loadAndRender() {{
       try {{ Plotly.Plots.resize(plotDiv); }} catch (_) {{}}
     }});
     await renderField(currentFamily, currentField);
-    loading.style.display = 'none';
   }} catch (err) {{
     loading.textContent = '渲染失败: ' + err.message;
     loading.style.color = '#f44';
@@ -722,8 +793,9 @@ def render_headless(data, config, output_dir: Path):
     shape_info = "sphere"
     view_cfgs = [
         ("render_main.html", (1.5, 1.8, 1.2)),
-        ("render_top.html", (0.0, 0.0, 2.5)),
         ("render_front.html", (0.0, 2.5, 0.5)),
+        ("render_top.html", (0.0, 0.0, 2.5)),
+        ("render_right.html", (2.5, 0.0, 0.5)),
     ]
     generated_files = []
     for filename, eye in view_cfgs:
@@ -908,7 +980,7 @@ def run_consistency_tests():
         # 手动积分（作为参考）
         r_vals = np.logspace(np.log10(0.01), np.log10(100), 500)
         pdf = (1/(r_vals * sigma_ln * np.sqrt(2*np.pi))) * np.exp(-(np.log(r_vals/r_g))**2/(2*sigma_ln**2))
-        pdf /= np.trapz(pdf, r_vals)
+        pdf /= np.trapezoid(pdf, r_vals)
         Bext_manual = 0.0
         for r, w in zip(r_vals, pdf):
             q_ext = AutoMieQ(m, wl_nm, 2*r, asDict=False)[0]
@@ -962,7 +1034,8 @@ def main():
         config['grid_dim'] = int(config.get('grid_dim', 120))
         config['photons'] = int(config.get('photons', 50000))
         requested_mode = normalize_field_compute_mode(config.get('field_compute_mode', 'proxy_only'))
-        collect_exact_fields = requested_mode != "proxy_only"
+        lidar_enabled = bool(config.get('lidar_enabled', False))
+        collect_exact_fields = requested_mode != "proxy_only" or lidar_enabled
         field_meta = build_field_catalog(config, exact_available=collect_exact_fields)
         temp_dir, output_dir = setup_directories(args.project_name)
 
@@ -983,8 +1056,12 @@ def main():
             grid_res_m=grid_res,
             record_spatial=False,
             record_back_hist=False,
-            source_type="planar",
-            source_width_m=field_data['L'],
+            source_type=str(config.get('source_type', 'planar')).lower(),
+            source_width_m=(
+                float(config.get('source_width_m', 0.0))
+                if float(config.get('source_width_m', 0.0)) > 0.0
+                else field_data['L']
+            ),
             sigma_ln=config['sigma_ln'],
             angstrom_q=config.get('angstrom_q', 1.3),
             collect_voxel_fields=collect_exact_fields,
@@ -992,9 +1069,19 @@ def main():
             field_back_half_angle_deg=float(config.get('field_back_half_angle_deg', 90.0)),
             field_quadrature_polar=int(config.get('field_quadrature_polar', 2)),
             field_quadrature_azimuth=int(config.get('field_quadrature_azimuth', 6)),
+            collect_lidar_observation=lidar_enabled,
+            range_bin_width_m=float(config.get('range_bin_width_m', 1.0)),
+            range_max_m=(
+                float(config.get('range_max_m', 0.0))
+                if float(config.get('range_max_m', 0.0)) > 0.0
+                else None
+            ),
+            receiver_overlap_min=float(config.get('receiver_overlap_min', 1.0)),
+            receiver_overlap_full_range_m=float(config.get('receiver_overlap_full_range_m', 0.0)),
         )
 
         exact_available = attach_exact_fields(field_data, sim_res)
+        lidar_available = attach_lidar_observation(field_data, sim_res)
         field_meta = build_field_catalog(config, exact_available=exact_available)
         field_data["field_meta"] = field_meta
         if field_meta["requested_field_compute_mode"] != field_meta["effective_field_compute_mode"]:
@@ -1022,6 +1109,7 @@ def main():
                 metrics[k] = v
         result_payload["metrics"] = metrics
         result_payload["artifacts"] = html_files
+        result_payload["lidar_observation_available"] = bool(lidar_available)
         result_payload.update(field_meta)
 
     except Exception as e:

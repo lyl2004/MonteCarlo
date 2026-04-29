@@ -23,7 +23,7 @@ if not hasattr(scipy.integrate, 'trapz'):
     if hasattr(scipy.integrate, 'trapezoid'):
         scipy.integrate.trapz = scipy.integrate.trapezoid
     else:
-        scipy.integrate.trapz = np.trapz
+        scipy.integrate.trapz = np.trapezoid
 
 if not hasattr(scipy.integrate, 'simps'):
     from scipy.integrate import simpson
@@ -347,7 +347,7 @@ def mie_effective_polarized(
 
     r_arr = np.array(r_list)
     weights_valid = np.array(w_list, dtype=float)
-    valid_total_w = np.trapz(weights_valid, r_arr)
+    valid_total_w = np.trapezoid(weights_valid, r_arr)
     if valid_total_w > 0:
         weights_valid /= valid_total_w
     else:
@@ -363,9 +363,9 @@ def mie_effective_polarized(
         sigma_sca_eff = float(weights_valid[0] * qsca_arr[0] * cross_arr[0])
         g_eff_sum = float(weights_valid[0] * g_qsca_cross_arr[0])
     else:
-        sigma_ext_eff = np.trapz(weights_valid * qext_arr * cross_arr, r_arr)
-        sigma_sca_eff = np.trapz(weights_valid * qsca_arr * cross_arr, r_arr)
-        g_eff_sum = np.trapz(weights_valid * g_qsca_cross_arr, r_arr)
+        sigma_ext_eff = np.trapezoid(weights_valid * qext_arr * cross_arr, r_arr)
+        sigma_sca_eff = np.trapezoid(weights_valid * qsca_arr * cross_arr, r_arr)
+        g_eff_sum = np.trapezoid(weights_valid * g_qsca_cross_arr, r_arr)
     g_final = g_eff_sum / sigma_sca_eff if sigma_sca_eff > 1e-20 else 0.0
 
     # ---------- 4. 积分 Mueller 矩阵（关键修复）----------
@@ -378,14 +378,14 @@ def mie_effective_polarized(
         M33_sum = weights_2d[0, 0] * np.array(m33_list[0], dtype=float)
         M34_sum = weights_2d[0, 0] * np.array(m34_list[0], dtype=float)
     else:
-        M11_sum = np.trapz(weights_2d * np.array(m11_list), r_arr, axis=0)
-        M12_sum = np.trapz(weights_2d * np.array(m12_list), r_arr, axis=0)
-        M33_sum = np.trapz(weights_2d * np.array(m33_list), r_arr, axis=0)
-        M34_sum = np.trapz(weights_2d * np.array(m34_list), r_arr, axis=0)
+        M11_sum = np.trapezoid(weights_2d * np.array(m11_list), r_arr, axis=0)
+        M12_sum = np.trapezoid(weights_2d * np.array(m12_list), r_arr, axis=0)
+        M33_sum = np.trapezoid(weights_2d * np.array(m33_list), r_arr, axis=0)
+        M34_sum = np.trapezoid(weights_2d * np.array(m34_list), r_arr, axis=0)
 
     # ---------- 5. 归一化相函数 ----------
     M11_sum = np.maximum(M11_sum, 0.0)
-    norm_integral = np.trapz(M11_sum * np.sin(theta_rad), theta_rad)
+    norm_integral = np.trapezoid(M11_sum * np.sin(theta_rad), theta_rad)
     if norm_integral > 1e-20:
         normalization_factor = 2.0 / norm_integral
         M11_norm = M11_sum * normalization_factor

@@ -288,6 +288,29 @@ def escape_transmittance_numba(use_3d_grid, grid_density, grid_origin, grid_step
 
 
 @jit(nopython=True, cache=True)
+def distance_to_z_exit_numba(thickness, z, uz):
+    if np.abs(uz) <= 1e-12:
+        return -1.0
+    if uz > 0.0:
+        s_exit = (thickness - z) / uz
+    else:
+        s_exit = -z / uz
+    return s_exit if s_exit > 0.0 else -1.0
+
+
+@jit(nopython=True, cache=True)
+def receiver_overlap_numba(range_m, overlap_min, overlap_full_range_m):
+    if overlap_full_range_m <= 1e-9:
+        return 1.0
+    frac = range_m / overlap_full_range_m
+    if frac < 0.0:
+        frac = 0.0
+    if frac > 1.0:
+        frac = 1.0
+    return overlap_min + (1.0 - overlap_min) * frac
+
+
+@jit(nopython=True, cache=True)
 def accumulate_detector_contribution_numba(
     forward_I, forward_Q, forward_U, forward_V,
     back_I, back_Q, back_U, back_V, event_count,
@@ -295,7 +318,10 @@ def accumulate_detector_contribution_numba(
     use_3d_grid, grid_density, grid_origin, grid_step,
     layer_boundaries, layer_betas, thickness,
     x, y, z, mie_angles_deg, mie_tables_all,
-    forward_dirs, forward_weights, back_dirs, back_weights
+    forward_dirs, forward_weights, back_dirs, back_weights,
+    path_length, collect_lidar_observation,
+    echo_I, echo_Q, echo_U, echo_V, echo_event_count, echo_weight_sum,
+    range_bin_width_m, range_max_m, overlap_min, overlap_full_range_m
 ):
     event_count[ix, iy, iz] += 1.0
 
@@ -344,6 +370,22 @@ def accumulate_detector_contribution_numba(
         back_Q[ix, iy, iz] += contrib * stokes_out[1]
         back_U[ix, iy, iz] += contrib * stokes_out[2]
         back_V[ix, iy, iz] += contrib * stokes_out[3]
+
+        if collect_lidar_observation:
+            s_exit = distance_to_z_exit_numba(thickness, z, dzo)
+            if s_exit > 0.0:
+                range_m = 0.5 * (path_length + s_exit)
+                if range_m >= 0.0 and range_m <= range_max_m:
+                    bin_idx = int(np.floor(range_m / range_bin_width_m))
+                    if bin_idx >= 0 and bin_idx < echo_I.shape[0]:
+                        overlap = receiver_overlap_numba(range_m, overlap_min, overlap_full_range_m)
+                        echo_contrib = contrib * overlap
+                        echo_I[bin_idx] += echo_contrib
+                        echo_Q[bin_idx] += echo_contrib * stokes_out[1]
+                        echo_U[bin_idx] += echo_contrib * stokes_out[2]
+                        echo_V[bin_idx] += echo_contrib * stokes_out[3]
+                        echo_event_count[bin_idx] += 1.0
+                        echo_weight_sum[bin_idx] += echo_contrib
 
 
 # =============================================================================
@@ -773,7 +815,10 @@ def mc_kernel_advanced_exact(
     theta_rad_grid, cdf_grids_all, mie_angles_deg, mie_tables_all,
     forward_dirs, forward_weights, back_dirs, back_weights,
     forward_I, forward_Q, forward_U, forward_V,
-    back_I, back_Q, back_U, back_V, event_count
+    back_I, back_Q, back_U, back_V, event_count,
+    collect_lidar_observation,
+    echo_I, echo_Q, echo_U, echo_V, echo_event_count, echo_weight_sum,
+    range_bin_width_m, range_max_m, overlap_min, overlap_full_range_m
 ):
     if beta_max_global <= 0:
         return 0, 0, 0, n_photons, 0.0, 0.0, 0.0, 0.0
@@ -802,6 +847,7 @@ def mc_kernel_advanced_exact(
         ux, uy, uz = init_ux, 0.0, init_uz
         stokes = np.array([1.0, 1.0, 0.0, 0.0])
         weight = 1.0
+        path_length = 0.0
 
         alive = True
         while alive:
@@ -817,6 +863,7 @@ def mc_kernel_advanced_exact(
                         x_new = x + s_move * ux
                         y_new = y + s_move * uy
                         z_new = z + s_move * uz
+                        path_length += s_move
                         if z_new < layer_boundaries[0]:
                             back_count += 1
                             total_back_I += weight
@@ -841,6 +888,7 @@ def mc_kernel_advanced_exact(
                 x_new = x + s_move * ux
                 y_new = y + s_move * uy
                 z_new = z + s_move * uz
+                path_length += s_move
                 if z_new < layer_boundaries[0]:
                     back_count += 1
                     total_back_I += weight
@@ -857,6 +905,7 @@ def mc_kernel_advanced_exact(
             x_new = x + s_tent * ux
             y_new = y + s_tent * uy
             z_new = z + s_tent * uz
+            path_length += s_tent
 
             if z_new < layer_boundaries[0]:
                 back_count += 1
@@ -903,7 +952,10 @@ def mc_kernel_advanced_exact(
                         use_3d_grid, grid_density, grid_origin, grid_step,
                         layer_boundaries, layer_betas, thickness,
                         x, y, z, mie_angles_deg, mie_tables_all,
-                        forward_dirs, forward_weights, back_dirs, back_weights
+                        forward_dirs, forward_weights, back_dirs, back_weights,
+                        path_length, collect_lidar_observation,
+                        echo_I, echo_Q, echo_U, echo_V, echo_event_count, echo_weight_sum,
+                        range_bin_width_m, range_max_m, overlap_min, overlap_full_range_m
                     )
 
             theta_s = sample_scattering_theta_layer(np.random.random(), theta_rad_grid, cdf_grids_all, mie_id)
@@ -1037,7 +1089,10 @@ def run_advanced_simulation(
     m_real=1.33, m_imag=0.0, angstrom_q=1.3,
     sigma_ln=0.35, collect_voxel_fields=False,
     field_forward_half_angle_deg=90.0, field_back_half_angle_deg=90.0,
-    field_quadrature_polar=2, field_quadrature_azimuth=6
+    field_quadrature_polar=2, field_quadrature_azimuth=6,
+    collect_lidar_observation=False,
+    range_bin_width_m=1.0, range_max_m=None,
+    receiver_overlap_min=1.0, receiver_overlap_full_range_m=0.0
 ):
     """
     高级蒙特卡洛仿真的高层接口，支持：
@@ -1327,6 +1382,20 @@ def run_advanced_simulation(
         exact_back_I = exact_back_Q = exact_back_U = exact_back_V = None
         exact_event_count = None
 
+    lidar_enabled = bool(collect_lidar_observation and use_exact_kernel)
+    rbw = max(float(range_bin_width_m), 1e-9)
+    rmax = float(range_max_m) if range_max_m is not None else float(current_z)
+    rmax = max(rmax, rbw)
+    n_range_bins = max(1, int(np.ceil(rmax / rbw)))
+    echo_I = np.zeros(n_range_bins, dtype=np.float64)
+    echo_Q = np.zeros(n_range_bins, dtype=np.float64)
+    echo_U = np.zeros(n_range_bins, dtype=np.float64)
+    echo_V = np.zeros(n_range_bins, dtype=np.float64)
+    echo_event_count = np.zeros(n_range_bins, dtype=np.float64)
+    echo_weight_sum = np.zeros(n_range_bins, dtype=np.float64)
+    overlap_min = max(0.0, min(1.0, float(receiver_overlap_min)))
+    overlap_full = max(0.0, float(receiver_overlap_full_range_m))
+
     while processed < total_photons:
         current_batch = min(BATCH_SIZE, total_photons - processed)
         if use_exact_kernel:
@@ -1339,7 +1408,10 @@ def run_advanced_simulation(
                 theta_rad_grid, cdf_all, base_mie.angles_deg, mie_tabs,
                 forward_dirs, forward_weights, back_dirs, back_weights,
                 exact_forward_I, exact_forward_Q, exact_forward_U, exact_forward_V,
-                exact_back_I, exact_back_Q, exact_back_U, exact_back_V, exact_event_count
+                exact_back_I, exact_back_Q, exact_back_U, exact_back_V, exact_event_count,
+                lidar_enabled,
+                echo_I, echo_Q, echo_U, echo_V, echo_event_count, echo_weight_sum,
+                rbw, rmax, overlap_min, overlap_full
             )
             tc, ac, bc, trc, b_I, b_Q, b_U, b_V = res
             ab = None
@@ -1416,6 +1488,43 @@ def run_advanced_simulation(
             "back_U": exact_back_U * inv_n,
             "back_V": exact_back_V * inv_n,
             "event_count": exact_event_count,
+        }
+    if lidar_enabled:
+        inv_n = 1.0 / ns
+        echo_I_n = echo_I * inv_n
+        echo_Q_n = echo_Q * inv_n
+        echo_U_n = echo_U * inv_n
+        echo_V_n = echo_V * inv_n
+        echo_depol = np.zeros_like(echo_I_n)
+        mask = echo_I_n > 1e-30
+        echo_depol[mask] = np.clip(
+            1.0 - np.sqrt(echo_Q_n[mask] ** 2 + echo_U_n[mask] ** 2 + echo_V_n[mask] ** 2) / echo_I_n[mask],
+            0.0,
+            1.0,
+        )
+        echo_relative_error = np.zeros_like(echo_I_n)
+        count_mask = echo_event_count > 0.0
+        echo_relative_error[count_mask] = 1.0 / np.sqrt(echo_event_count[count_mask])
+        arrays["lidar_observation"] = {
+            "range_bins_m": (np.arange(n_range_bins, dtype=np.float64) + 0.5) * rbw,
+            "echo_I": echo_I_n,
+            "echo_Q": echo_Q_n,
+            "echo_U": echo_U_n,
+            "echo_V": echo_V_n,
+            "echo_power": echo_I_n.copy(),
+            "echo_depol": echo_depol,
+            "echo_event_count": echo_event_count,
+            "echo_weight_sum": echo_weight_sum * inv_n,
+            "echo_relative_error_est": echo_relative_error,
+            "receiver_model": {
+                "range_bin_width_m": rbw,
+                "range_max_m": rmax,
+                "receiver_mode": "backscatter",
+                "overlap_model": "linear",
+                "overlap_min": overlap_min,
+                "overlap_full_range_m": overlap_full,
+                "source_range_path": "event_path_plus_escape_over_two",
+            },
         }
 
     return {

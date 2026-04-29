@@ -336,6 +336,9 @@ def main():
             result_payload["field_mode_note"] = julia_response.get(
                 "field_mode_note", field_meta["field_mode_note"]
             )
+            result_payload["lidar_observation_available"] = bool(
+                julia_response.get("lidar_observation_available", False)
+            )
             print(f">> [Worker] 仿真成功，耗时 {dt:.2f}s，R_back={metrics.get('R_back',0):.6f}",
                   flush=True)
         else:

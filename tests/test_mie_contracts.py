@@ -143,7 +143,10 @@ class MieContractTests(unittest.TestCase):
             field = mie_worker.generate_field(config, temp_dir, layers)
             files = mie_worker.render_headless(field, config, output_dir)
 
-            self.assertEqual(files, ["render_main.html", "render_top.html", "render_front.html"])
+            self.assertEqual(
+                files,
+                ["render_main.html", "render_front.html", "render_top.html", "render_right.html"],
+            )
             self.assertTrue((output_dir / "density.npz").exists())
             with np.load(output_dir / "density.npz") as data:
                 self.assertIn("density", data.files)

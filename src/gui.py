@@ -91,6 +91,11 @@ PARAM_DEF = {
     "scale_height_m": {"label": "消光标高 (指数廓线)",     "unit": "米",   "group": "仿真参数"},
     "angstrom_q":     {"label": "Angström 指数 q",         "unit": "无",   "group": "仿真参数"},
     "field_compute_mode": {"label": "场计算模式",          "unit": "无",   "group": "仿真参数"},
+    "lidar_enabled": {"label": "输出距离门回波",           "unit": "开关", "group": "激光雷达观测参数"},
+    "range_bin_width_m": {"label": "距离门宽度",           "unit": "米",   "group": "激光雷达观测参数"},
+    "range_max_m": {"label": "最大观测距离",               "unit": "米",   "group": "激光雷达观测参数"},
+    "receiver_overlap_min": {"label": "近场重叠下限",      "unit": "无",   "group": "激光雷达观测参数"},
+    "receiver_overlap_full_range_m": {"label": "完全重叠距离", "unit": "米", "group": "激光雷达观测参数"},
     "tmatrix_solver": {"label": "T-Matrix 求解器",         "unit": "无",   "group": "仿真参数"},
     "forward_mode":   {"label": "前向散射取值模式",        "unit": "无",   "group": "仿真参数"},
     "forward_cone_deg": {"label": "前向散射锥角",          "unit": "度",   "group": "仿真参数"},
@@ -164,6 +169,11 @@ DEFAULT_CONFIG = {
     "iitm_nr_scale_on_fallback": 1.25,
     "iitm_ntheta_scale_on_fallback": 1.5,
     "field_compute_mode": "proxy_only",
+    "lidar_enabled": False,
+    "range_bin_width_m": 1.0,
+    "range_max_m": 0.0,
+    "receiver_overlap_min": 1.0,
+    "receiver_overlap_full_range_m": 0.0,
     # 渲染
     "explode_dist": 0.7,
 }
@@ -194,20 +204,18 @@ state = AppState()
 
 VIEW_MODE_LABELS = {
     "main": "主视",
-    "top": "顶视",
     "front": "前视",
-    "bottom": "底视",
-    "left": "左视",
+    "top": "顶视",
+    "right": "右视",
 }
 
-VIEW_MODE_ORDER = ["main", "top", "front", "bottom", "left"]
+VIEW_MODE_ORDER = ["main", "front", "top", "right"]
 
 VIEW_MODE_TO_FILENAMES = {
     "main": ("render_main.html",),
-    "top": ("render_top.html",),
     "front": ("render_front.html",),
-    "bottom": ("render_bottom.html",),
-    "left": ("render_left.html",),
+    "top": ("render_top.html",),
+    "right": ("render_right.html",),
 }
 
 FIELD_FAMILY_LABELS = {
@@ -419,6 +427,11 @@ def load_ui_from_config():
                             ).props('outlined dense').classes('w-full bg-white')
                             sel.on_value_change(handler)
 
+                        elif isinstance(value, bool):
+                            ui.switch(text=label_text, value=value) \
+                                .classes('w-full bg-white p-2 rounded') \
+                                .on_value_change(handler)
+
                         elif isinstance(value, (int, float)):
                             ui.number(label=label_text, value=value, format='%.4g') \
                                 .props('outlined dense').classes('w-full bg-white') \
@@ -546,7 +559,7 @@ def _field_entry(family: str, name: str) -> dict[str, str]:
     return {"name": name, "label": label}
 
 
-def _infer_iitm_field_catalog_from_artifacts(artifacts: list[str]) -> dict[str, list[dict[str, str]]]:
+def _infer_field_catalog_from_artifacts(artifacts: list[str]) -> dict[str, list[dict[str, str]]]:
     proxy_order = ["beta_back", "beta_forward", "depol_ratio", "density"]
     exact_order = ["beta_back", "beta_forward", "depol_ratio", "event_count"]
     found: dict[str, set[str]] = {"proxy": set(), "exact": set()}
@@ -576,8 +589,8 @@ def _infer_iitm_field_catalog_from_artifacts(artifacts: list[str]) -> dict[str, 
     return catalog
 
 
-def _infer_iitm_field_catalog_from_npz() -> dict[str, list[dict[str, str]]]:
-    if state.simulation_backend != "iitm" or not state.current_project:
+def _infer_field_catalog_from_npz() -> dict[str, list[dict[str, str]]]:
+    if state.simulation_backend not in ("iitm", "mie") or not state.current_project:
         return {}
     npz_path = os.path.join(get_output_dir(), state.current_project, "density.npz")
     if not os.path.exists(npz_path):
@@ -606,22 +619,22 @@ def _infer_iitm_field_catalog_from_npz() -> dict[str, list[dict[str, str]]]:
 
 
 def _catalog_for_current_output() -> dict[str, list[dict[str, str]]] | None:
-    if state.simulation_backend != "iitm":
+    if state.simulation_backend not in ("iitm", "mie"):
         return None
-    inferred = _infer_iitm_field_catalog_from_npz()
+    inferred = _infer_field_catalog_from_npz()
     if inferred:
         return inferred
     artifacts = _normalize_artifacts(state.current_artifacts)
     if not artifacts:
         artifacts = _discover_output_artifacts()
         state.current_artifacts = artifacts
-    inferred = _infer_iitm_field_catalog_from_artifacts(artifacts)
+    inferred = _infer_field_catalog_from_artifacts(artifacts)
     return inferred or None
 
 
 def _set_field_catalog(catalog=None, backend: str | None = None) -> None:
     backend = backend or state.simulation_backend
-    if catalog is None and backend == "iitm":
+    if catalog is None and backend in ("iitm", "mie"):
         catalog = _catalog_for_current_output()
     normalized = _normalize_field_catalog(catalog, backend)
     state.current_field_catalog = normalized
@@ -703,7 +716,7 @@ def _get_available_view_files() -> dict[str, str]:
     view_files: dict[str, str] = {}
     for filename in artifacts:
         if state.simulation_backend in ("iitm", "mie"):
-            if filename not in {"render_main.html", "render_top.html", "render_front.html"}:
+            if filename not in {"render_main.html", "render_front.html", "render_top.html", "render_right.html"}:
                 continue
         mode = _artifact_to_view_mode(filename)
         if mode and mode not in view_files:
@@ -712,13 +725,48 @@ def _get_available_view_files() -> dict[str, str]:
 
 
 def _build_field_preview_query() -> str:
+    max_grid = int(float(state.config_data.get("preview_max_grid", 48) or 48))
     params = {
         "t": f"{time.time()}",
         "embed": "1",
         "family": state.current_field_family,
         "field": state.current_iitm_field,
+        "max_grid": str(max(16, min(max_grid, 96))),
     }
     return urlencode(params)
+
+
+def _post_field_preview_update() -> None:
+    if state.simulation_backend not in ("iitm", "mie"):
+        refresh_preview()
+        return
+    payload = json.dumps({
+        "type": "iitm:set_field",
+        "family": state.current_field_family,
+        "field": state.current_iitm_field,
+    }, ensure_ascii=False)
+    ui.run_javascript(f"""
+    (() => {{
+      const frame = document.getElementById('field-preview-frame');
+      if (frame && frame.contentWindow) {{
+        frame.contentWindow.postMessage({payload}, '*');
+      }}
+    }})();
+    """)
+
+
+def _switch_preview_family(family_name: str) -> None:
+    state.current_field_family = family_name
+    field_order = _get_backend_field_order()
+    if field_order and state.current_iitm_field not in field_order:
+        state.current_iitm_field = field_order[0]
+    refresh_preview()
+
+
+def _switch_preview_field(field_name: str) -> None:
+    state.current_iitm_field = field_name
+    _post_field_preview_update()
+
 
 def refresh_preview(view_mode=None):
     if view_mode:
@@ -781,10 +829,7 @@ def refresh_preview(view_mode=None):
                 for family_name in family_order:
                     ui.button(
                         FIELD_FAMILY_LABELS.get(family_name, family_name),
-                        on_click=lambda fam=family_name: (
-                            setattr(state, 'current_field_family', fam),
-                            refresh_preview()
-                        )
+                        on_click=lambda fam=family_name: _switch_preview_family(fam)
                     ).style(family_btn_style(family_name)).props('dense size=sm')
 
             with ui.row().classes('absolute top-16 left-4 z-50 gap-2'):
@@ -799,10 +844,7 @@ def refresh_preview(view_mode=None):
                     field_name = item["name"]
                     ui.button(
                         _get_field_label(field_name),
-                        on_click=lambda f=field_name: (
-                            setattr(state, 'current_iitm_field', f),
-                            refresh_preview()
-                        )
+                        on_click=lambda f=field_name: _switch_preview_field(f)
                     ).style(field_btn_style(field_name)).props('dense size=sm')
 
         if os.path.exists(file_path):
@@ -810,7 +852,7 @@ def refresh_preview(view_mode=None):
             iframe_src = (f"/static_outputs/{reg['output_sub']}/{proj}"
                           f"/{target_filename}?{iframe_query}")
             ui.html(
-                f'<iframe src="{iframe_src}" '
+                f'<iframe id="field-preview-frame" src="{iframe_src}" '
                 f'style="position:absolute;inset:0;width:100%;height:100%;border:none;display:block;" '
                 f'allow="fullscreen" scrolling="no"></iframe>',
                 sanitize=False
@@ -1031,6 +1073,8 @@ def _handle_simulation_result(res: dict, status_label, log_view):
             parts.append(f"depol={depol:.4f}")
         elif depol_back is not None:
             parts.append(f"depol_b={depol_back:.4f}")
+        if res.get("lidar_observation_available"):
+            parts.append("lidar_echo=on")
         status_label.text = "  |  ".join(parts)
         status_label.classes(remove='text-gray-400 text-red-500',
                              add='text-green-500 font-bold')

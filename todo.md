@@ -25,11 +25,44 @@
 - Python 和 Julia 的退偏比均已钳制到 `[0, 1]`。
 - 已有测试：
   - Python/Mie 协议测试：`tests/test_mie_contracts.py`
+  - Python/Mie 距离门观测合约测试：`tests/test_mie_lidar_observation.py`
+  - 数据集样本协议测试：`tests/test_dataset_contract.py`
   - Julia 场族协议测试：`tests/julia_field_contract.jl`
+  - Julia 距离门观测合约测试：`tests/julia_lidar_contract.jl`
   - Julia server `field_compute_mode` 测试：`tests/julia_server_contract.jl`
   - Julia 内置物理回归：`src/julia/iitm_physics.jl`
 
 ## P0
+
+### T0. 时间门控激光雷达观测算子与样本协议
+
+当前状态：
+
+- Mie/Numba exact 事件累积已新增 range-bin lidar observation。
+- Julia/IITM chunk-local MC 已新增同构 range-bin lidar observation，并在主线程归并。
+- 两套后端均使用同名输出字段：
+  - `range_bins_m`
+  - `echo_I / echo_Q / echo_U / echo_V`
+  - `echo_power`
+  - `echo_depol`
+  - `echo_event_count`
+  - `echo_weight_sum`
+  - `echo_relative_error_est`
+- `density.npz` 已保存 lidar observation 数组。
+- Mie 与 Julia 均支持 receiver overlap 简化线性模型：
+  - `receiver_overlap_min`
+  - `receiver_overlap_full_range_m`
+- 已新增数据集样本协议与 Mie 批量 runner：
+  - `src/dataset_sampling.py`
+  - `src/dataset_runner.py`
+  - 单样本输出 `observation.npz / truth.json / receiver.json / quality.json / run_config.json`
+
+仍需完成：
+
+- 增加更严格的解析雷达方程趋势回归。
+- 增加大样本统计稳定性验收。
+- Julia 批量 dataset runner 仍需接入 HTTP/server 执行路径。
+- GUI 目前只提供参数入口和运行状态提示，尚未增加 `P(R)` 曲线预览。
 
 ### T1. 收口 `proxy` 与 `exact` 的正式物理定义
 

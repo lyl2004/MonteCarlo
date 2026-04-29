@@ -848,6 +848,7 @@ struct MCStats
     depolarization_ratio :: Float64
     backscatter_angle_dist :: Vector{Int}
     voxel_fields         :: Union{Nothing, Any}
+    lidar_observation    :: Union{Nothing, Any}
 end
 
 struct MCVoxelObservables
@@ -874,6 +875,20 @@ mutable struct MCVoxelSparseEntry
     event_count :: Float64
 end
 
+mutable struct MCLidarObservation
+    range_bins_m :: Vector{Float64}
+    echo_I       :: Vector{Float64}
+    echo_Q       :: Vector{Float64}
+    echo_U       :: Vector{Float64}
+    echo_V       :: Vector{Float64}
+    echo_power   :: Vector{Float64}
+    echo_depol   :: Vector{Float64}
+    echo_event_count :: Vector{Float64}
+    echo_weight_sum  :: Vector{Float64}
+    echo_relative_error_est :: Vector{Float64}
+    receiver_model :: Dict{String,Any}
+end
+
 struct MCChunkResult
     total_collisions :: Int
     absorbed_count   :: Int
@@ -885,11 +900,84 @@ struct MCChunkResult
     total_back_U     :: Float64
     total_back_V     :: Float64
     voxel_map        :: Union{Nothing, Dict{Int,MCVoxelSparseEntry}}
+    lidar_observation :: Union{Nothing, MCLidarObservation}
 end
 
 struct DetectorCone
     dirs    :: Vector{NTuple{3,Float64}}
     weights :: Vector{Float64}
+end
+
+function make_lidar_observation(n_bins::Int, range_bin_width_m::Float64,
+                                range_max_m::Float64, overlap_min::Float64,
+                                overlap_full_range_m::Float64)
+    range_bins = [(i - 0.5) * range_bin_width_m for i in 1:n_bins]
+    return MCLidarObservation(
+        range_bins,
+        zeros(Float64, n_bins),
+        zeros(Float64, n_bins),
+        zeros(Float64, n_bins),
+        zeros(Float64, n_bins),
+        zeros(Float64, n_bins),
+        zeros(Float64, n_bins),
+        zeros(Float64, n_bins),
+        zeros(Float64, n_bins),
+        zeros(Float64, n_bins),
+        Dict{String,Any}(
+            "range_bin_width_m" => range_bin_width_m,
+            "range_max_m" => range_max_m,
+            "receiver_mode" => "backscatter",
+            "overlap_model" => "linear",
+            "overlap_min" => overlap_min,
+            "overlap_full_range_m" => overlap_full_range_m,
+            "source_range_path" => "event_path_plus_escape_over_two",
+        ),
+    )
+end
+
+@inline function distance_to_z_exit(thickness::Float64, z::Float64, uz::Float64)
+    abs(uz) <= 1e-12 && return -1.0
+    s = uz > 0.0 ? (thickness - z) / uz : -z / uz
+    return s > 0.0 ? s : -1.0
+end
+
+@inline function receiver_overlap(range_m::Float64, overlap_min::Float64,
+                                  overlap_full_range_m::Float64)
+    overlap_full_range_m <= 1e-9 && return 1.0
+    frac = clamp(range_m / overlap_full_range_m, 0.0, 1.0)
+    return overlap_min + (1.0 - overlap_min) * frac
+end
+
+function merge_lidar_observation!(dst::MCLidarObservation, src::MCLidarObservation)
+    dst.echo_I .+= src.echo_I
+    dst.echo_Q .+= src.echo_Q
+    dst.echo_U .+= src.echo_U
+    dst.echo_V .+= src.echo_V
+    dst.echo_power .+= src.echo_power
+    dst.echo_event_count .+= src.echo_event_count
+    dst.echo_weight_sum .+= src.echo_weight_sum
+    return dst
+end
+
+function finalize_lidar_observation!(obs::MCLidarObservation, n_photons::Int)
+    inv_n = 1.0 / max(n_photons, 1)
+    obs.echo_I .*= inv_n
+    obs.echo_Q .*= inv_n
+    obs.echo_U .*= inv_n
+    obs.echo_V .*= inv_n
+    obs.echo_power .= obs.echo_I
+    obs.echo_weight_sum .*= inv_n
+    @inbounds for i in eachindex(obs.echo_I)
+        if obs.echo_I[i] > 1e-30
+            pol = sqrt(obs.echo_Q[i]^2 + obs.echo_U[i]^2 + obs.echo_V[i]^2) / obs.echo_I[i]
+            obs.echo_depol[i] = clamp(1.0 - pol, 0.0, 1.0)
+        else
+            obs.echo_depol[i] = 0.0
+        end
+        obs.echo_relative_error_est[i] = obs.echo_event_count[i] > 0.0 ?
+            1.0 / sqrt(obs.echo_event_count[i]) : 0.0
+    end
+    return obs
 end
 
 @inline function new_voxel_sparse_entry()
@@ -1199,10 +1287,10 @@ function accumulate_detector_contribution!(voxel_fields::MCVoxelObservables,
                                           a_deg::Vector{Float64},
                                           M11::Vector{Float64},
                                           M12::Vector{Float64},
-                                          M33::Vector{Float64},
-                                          M34::Vector{Float64},
-                                          forward_cone::DetectorCone,
-                                          back_cone::DetectorCone)
+                                           M33::Vector{Float64},
+                                           M34::Vector{Float64},
+                                           forward_cone::DetectorCone,
+                                           back_cone::DetectorCone)
     voxel_fields.event_count[ix, iy, iz] += 1.0
     for (dir, w_cone) in zip(forward_cone.dirs, forward_cone.weights)
         dxo, dyo, dzo = dir
@@ -1253,10 +1341,16 @@ function accumulate_detector_contribution!(voxel_map::Dict{Int,MCVoxelSparseEntr
                                           a_deg::Vector{Float64},
                                           M11::Vector{Float64},
                                           M12::Vector{Float64},
-                                          M33::Vector{Float64},
-                                          M34::Vector{Float64},
-                                          forward_cone::DetectorCone,
-                                          back_cone::DetectorCone)
+                                           M33::Vector{Float64},
+                                           M34::Vector{Float64},
+                                           forward_cone::DetectorCone,
+                                           back_cone::DetectorCone,
+                                           path_length::Float64,
+                                           lidar_observation,
+                                           range_bin_width_m::Float64,
+                                           range_max_m::Float64,
+                                           overlap_min::Float64,
+                                           overlap_full_range_m::Float64)
     lin = voxel_linear_index(ix, iy, iz, nx, ny)
     entry = get!(voxel_map, lin) do
         new_voxel_sparse_entry()
@@ -1291,6 +1385,26 @@ function accumulate_detector_contribution!(voxel_map::Dict{Int,MCVoxelSparseEntr
         entry.back_Q += contrib * S_out[2]
         entry.back_U += contrib * S_out[3]
         entry.back_V += contrib * S_out[4]
+        if lidar_observation !== nothing
+            s_exit = distance_to_z_exit(thickness, z, dzo)
+            if s_exit > 0.0
+                range_m = 0.5 * (path_length + s_exit)
+                if 0.0 <= range_m <= range_max_m
+                    bin_idx = floor(Int, range_m / range_bin_width_m) + 1
+                    if 1 <= bin_idx <= length(lidar_observation.echo_I)
+                        overlap = receiver_overlap(range_m, overlap_min, overlap_full_range_m)
+                        echo_contrib = contrib * overlap
+                        lidar_observation.echo_I[bin_idx] += echo_contrib
+                        lidar_observation.echo_Q[bin_idx] += echo_contrib * S_out[2]
+                        lidar_observation.echo_U[bin_idx] += echo_contrib * S_out[3]
+                        lidar_observation.echo_V[bin_idx] += echo_contrib * S_out[4]
+                        lidar_observation.echo_power[bin_idx] += echo_contrib
+                        lidar_observation.echo_event_count[bin_idx] += 1.0
+                        lidar_observation.echo_weight_sum[bin_idx] += echo_contrib
+                    end
+                end
+            end
+        end
     end
 end
 
@@ -1315,10 +1429,15 @@ function run_monte_carlo_chunk(photon_range::UnitRange{Int},
                                z_edges::Vector{Float64},
                                slab_beta::Vector{Float64},
                                global_beta_max::Float64,
-                               slab_eps::Float64,
-                               collect_voxel_fields::Bool,
-                               forward_cone::DetectorCone,
-                               back_cone::DetectorCone)
+                                slab_eps::Float64,
+                                collect_voxel_fields::Bool,
+                                forward_cone::DetectorCone,
+                                back_cone::DetectorCone,
+                                collect_lidar_observation::Bool,
+                                range_bin_width_m::Float64,
+                                range_max_m::Float64,
+                                overlap_min::Float64,
+                                overlap_full_range_m::Float64)
     nx, ny, nz = size(density_grid)
     rng = MersenneTwister(chunk_seed)
     total_collisions = 0
@@ -1331,6 +1450,10 @@ function run_monte_carlo_chunk(photon_range::UnitRange{Int},
     total_back_U     = 0.0
     total_back_V     = 0.0
     voxel_map = collect_voxel_fields ? Dict{Int,MCVoxelSparseEntry}() : nothing
+    n_range_bins = max(1, ceil(Int, range_max_m / range_bin_width_m))
+    lidar_observation = collect_lidar_observation ?
+        make_lidar_observation(n_range_bins, range_bin_width_m, range_max_m,
+                               overlap_min, overlap_full_range_m) : nothing
 
     for _ in photon_range
         x, y, z    = 0.0, 0.0, 0.0
@@ -1338,6 +1461,7 @@ function run_monte_carlo_chunk(photon_range::UnitRange{Int},
         S          = (1.0, 1.0, 0.0, 0.0)
         weight     = 1.0
         alive      = true
+        path_length = 0.0
 
         while alive
             beta_majorant = global_beta_max
@@ -1352,6 +1476,7 @@ function run_monte_carlo_chunk(photon_range::UnitRange{Int},
                         x_new  = x + s_move * ux
                         y_new  = y + s_move * uy
                         z_new  = z + s_move * uz
+                        path_length += s_move
                         if z_new < 0.0
                             back_count += 1
                             alive       = false
@@ -1384,6 +1509,7 @@ function run_monte_carlo_chunk(photon_range::UnitRange{Int},
                 x_new  = x + s_move * ux
                 y_new  = y + s_move * uy
                 z_new  = z + s_move * uz
+                path_length += s_move
                 if z_new < 0.0
                     back_count += 1
                     alive       = false
@@ -1409,6 +1535,7 @@ function run_monte_carlo_chunk(photon_range::UnitRange{Int},
             x_new  = x + s_tent * ux
             y_new  = y + s_tent * uy
             z_new  = z + s_tent * uz
+            path_length += s_tent
 
             if z_new < 0.0
                 back_count += 1
@@ -1450,10 +1577,13 @@ function run_monte_carlo_chunk(photon_range::UnitRange{Int},
                     ix, iy, iz = vidx
                     accumulate_detector_contribution!(voxel_map, ix, iy, iz, nx, ny, S, weight,
                                                       ux, uy, uz, use_density_grid, density_grid,
-                                                      sampling_mode, beta_surf, H, x0, y0, z0,
-                                                      dx, dy, dz, thickness, x, y, z,
-                                                      a_deg, M11, M12, M33, M34,
-                                                      forward_cone, back_cone)
+                                                       sampling_mode, beta_surf, H, x0, y0, z0,
+                                                       dx, dy, dz, thickness, x, y, z,
+                                                       a_deg, M11, M12, M33, M34,
+                                                       forward_cone, back_cone,
+                                                       path_length, lidar_observation,
+                                                       range_bin_width_m, range_max_m,
+                                                       overlap_min, overlap_full_range_m)
                 end
             end
 
@@ -1497,6 +1627,7 @@ function run_monte_carlo_chunk(photon_range::UnitRange{Int},
         total_back_U,
         total_back_V,
         voxel_map,
+        lidar_observation,
     )
 end
 
@@ -1508,10 +1639,16 @@ function run_monte_carlo(scatter::Dict, mc_cfg::Dict)
     n_photons = Int(    mc_cfg["n_photons"])
     seed      = Int(    get(mc_cfg, "seed", 0))
     collect_voxel_fields = Bool(get(mc_cfg, "collect_voxel_fields", false))
+    collect_lidar_observation = Bool(get(mc_cfg, "collect_lidar_observation", false))
     forward_half_angle_deg = Float64(get(mc_cfg, "field_forward_half_angle_deg", 90.0))
     back_half_angle_deg = Float64(get(mc_cfg, "field_back_half_angle_deg", 90.0))
     quad_polar = Int(get(mc_cfg, "field_quadrature_polar", 2))
     quad_azimuth = Int(get(mc_cfg, "field_quadrature_azimuth", 6))
+    range_bin_width_m = max(Float64(get(mc_cfg, "range_bin_width_m", 1.0)), 1e-9)
+    range_max_m = Float64(get(mc_cfg, "range_max_m", thickness))
+    range_max_m = range_max_m > 0.0 ? range_max_m : thickness
+    overlap_min = clamp(Float64(get(mc_cfg, "receiver_overlap_min", 1.0)), 0.0, 1.0)
+    overlap_full_range_m = max(Float64(get(mc_cfg, "receiver_overlap_full_range_m", 0.0)), 0.0)
 
     theta_grid = scatter["theta_rad_grid"] :: Vector{Float64}
     cdf        = scatter["cdf_grid"]       :: Vector{Float64}
@@ -1559,9 +1696,13 @@ function run_monte_carlo(scatter::Dict, mc_cfg::Dict)
         slab_beta = build_slab_majorants(beta_surf, density_grid, sampling_mode)
         global_beta_max = maximum(slab_beta)
         if global_beta_max <= 1e-30
-            return MCStats(0.0, 0.0, 0.0, 1.0, 0.0, zeros(Int, 900), nothing)
+            empty_lidar = collect_lidar_observation ?
+                make_lidar_observation(max(1, ceil(Int, range_max_m / range_bin_width_m)),
+                                       range_bin_width_m, range_max_m, overlap_min,
+                                       overlap_full_range_m) : nothing
+            return MCStats(0.0, 0.0, 0.0, 1.0, 0.0, zeros(Int, 900), nothing, empty_lidar)
         end
-        if collect_voxel_fields
+        if collect_voxel_fields || collect_lidar_observation
             voxel_fields = MCVoxelObservables(
                 zeros(Float64, nx, ny, nz),
                 zeros(Float64, nx, ny, nz),
@@ -1633,6 +1774,11 @@ function run_monte_carlo(scatter::Dict, mc_cfg::Dict)
             voxel_fields !== nothing,
             forward_cone,
             back_cone,
+            collect_lidar_observation,
+            range_bin_width_m,
+            range_max_m,
+            overlap_min,
+            overlap_full_range_m,
         )
     end
 
@@ -1645,6 +1791,10 @@ function run_monte_carlo(scatter::Dict, mc_cfg::Dict)
     total_back_Q     = 0.0
     total_back_U     = 0.0
     total_back_V     = 0.0
+    lidar_observation = collect_lidar_observation ?
+        make_lidar_observation(max(1, ceil(Int, range_max_m / range_bin_width_m)),
+                               range_bin_width_m, range_max_m, overlap_min,
+                               overlap_full_range_m) : nothing
     for chunk_result in chunk_results
         total_collisions += chunk_result.total_collisions
         absorbed_count   += chunk_result.absorbed_count
@@ -1659,6 +1809,9 @@ function run_monte_carlo(scatter::Dict, mc_cfg::Dict)
         end
         if voxel_fields !== nothing && chunk_result.voxel_map !== nothing
             merge_sparse_voxel_fields!(voxel_fields, chunk_result.voxel_map)
+        end
+        if lidar_observation !== nothing && chunk_result.lidar_observation !== nothing
+            merge_lidar_observation!(lidar_observation, chunk_result.lidar_observation)
         end
     end
 
@@ -1676,6 +1829,9 @@ function run_monte_carlo(scatter::Dict, mc_cfg::Dict)
         voxel_fields.back_U      .*= inv_n
         voxel_fields.back_V      .*= inv_n
     end
+    if lidar_observation !== nothing
+        finalize_lidar_observation!(lidar_observation, n_safe)
+    end
 
     return MCStats(
         total_collisions / n_safe,
@@ -1685,6 +1841,7 @@ function run_monte_carlo(scatter::Dict, mc_cfg::Dict)
         1.0 - avg_pol,
         angle_bins,
         voxel_fields,
+        lidar_observation,
     )
 end
 
@@ -1919,6 +2076,9 @@ function build_field_bundle(field::Dict, scatter::Dict, config::Dict, mc::MCStat
         "effective_field_compute_mode" => effective_mode,
         "primary_field_family" => primary_family,
     )
+    if mc.lidar_observation !== nothing
+        bundle["lidar_observation"] = mc.lidar_observation
+    end
     mode_note === nothing || (bundle["field_mode_note"] = mode_note)
     return bundle
 end
@@ -2104,13 +2264,28 @@ function save_field_npz(field::Dict, fields::Dict, scatter::Dict, output_dir::St
     arrays["lut_depol"] = Float32.(get(primary_fields, "lut_depol", zeros(Float64, length(axis))))
     arrays["summary"] = summarize_field_family(primary_fields, scatter)
 
+    if haskey(bundle, "lidar_observation")
+        obs = bundle["lidar_observation"] :: MCLidarObservation
+        arrays["range_bins_m"] = Float32.(obs.range_bins_m)
+        arrays["echo_I"] = Float32.(obs.echo_I)
+        arrays["echo_Q"] = Float32.(obs.echo_Q)
+        arrays["echo_U"] = Float32.(obs.echo_U)
+        arrays["echo_V"] = Float32.(obs.echo_V)
+        arrays["echo_power"] = Float32.(obs.echo_power)
+        arrays["echo_depol"] = Float32.(obs.echo_depol)
+        arrays["echo_event_count"] = Float32.(obs.echo_event_count)
+        arrays["echo_weight_sum"] = Float32.(obs.echo_weight_sum)
+        arrays["echo_relative_error_est"] = Float32.(obs.echo_relative_error_est)
+        arrays["receiver_model_json_utf8"] = UInt8.(codeunits(String(JSON3.write(obs.receiver_model))))
+    end
+
     npz_path = joinpath(output_dir, "density.npz")
     npzwrite(npz_path, arrays)
     return npz_path
 end
 
 """
-生成三个视角 HTML 文件。
+生成四个视角 HTML 文件。
 
 每个 HTML 约 10KB（不含数据），通过 fetch('./density.npz') 加载数据。
 浏览器端完成：JSZip 解压 → npy 解析 → 笛卡尔积坐标生成 → Plotly volume 渲染。
@@ -2134,8 +2309,9 @@ function render_to_html(field::Dict, fields::Dict, scatter::Dict,
     # 各视角的初始相机方向（归一化到 [-2,2] 范围，Plotly 约定）
     view_cfgs = [
         ("render_main.html",  ( 1.5,  1.8,  1.2)),
-        ("render_top.html",   ( 0.0,  0.0,  2.5)),
         ("render_front.html", ( 0.0,  2.5,  0.5)),
+        ("render_top.html",   ( 0.0,  0.0,  2.5)),
+        ("render_right.html", ( 2.5,  0.0,  0.5)),
     ]
 
     # ── HTML 模板（数据通过 fetch 加载，不内联）──────────────────
@@ -2190,6 +2366,7 @@ const EMBED_MODE = URL_PARAMS.get('embed') === '1';
 const START_FAMILY = URL_PARAMS.get('family') || 'proxy';
 const START_FIELD = URL_PARAMS.get('field') || 'beta_back';
 const DATA_VERSION = URL_PARAMS.get('t') || String(Date.now());
+const MAX_PREVIEW_GRID = Math.max(16, parseInt(URL_PARAMS.get('max_grid') || '64', 10));
 const FIELD_CATALOG = FIELD_CATALOG_JSON;
 if (EMBED_MODE) document.body.classList.add('embed');
 
@@ -2259,34 +2436,35 @@ async function loadAndRender() {
       return parseNpy(buf);
     }
 
-    const densObj = await readArray('density');
     const summaryObj = await readArray('summary');
 
-    const density = densObj.data;   // Float32Array，长度 N³
     const defaultSummary = summaryObj.data;
-    const shape   = densObj.shape;  // [N, N, N]
-    const N       = shape[0];
 
     // 3. 生成坐标轴
     const axisObj = await readArray('axis');
     const axis    = axisObj.data;   // Float32Array，长度 N
+    const N       = axis.length;
+    const stride = Math.max(1, Math.ceil(N / MAX_PREVIEW_GRID));
+    const previewN = Math.ceil(N / stride);
 
-    // 4. 展开完整笛卡尔积坐标（Plotly volume 要求所有 N³ 点都有坐标）
+    // 4. 展开预览坐标；大网格降采样，避免 WebView 一次渲染 N³ 点。
     loading.textContent = '正在生成坐标网格...';
-    const total = N * N * N;
+    const total = previewN * previewN * previewN;
     const xs = new Float32Array(total);
     const ys = new Float32Array(total);
     const zs = new Float32Array(total);
+    const previewFlatIndices = new Int32Array(total);
 
     // Julia 存储顺序：density[ix, iy, iz]，列主序（Fortran order）
     // 展开时需要与 Julia 的内存布局一致
     let idx = 0;
-    for (let iz = 0; iz < N; iz++)
-      for (let iy = 0; iy < N; iy++)
-        for (let ix = 0; ix < N; ix++) {
+    for (let iz = 0; iz < N; iz += stride)
+      for (let iy = 0; iy < N; iy += stride)
+        for (let ix = 0; ix < N; ix += stride) {
           xs[idx] = axis[ix];
           ys[idx] = axis[iy];
           zs[idx] = axis[iz];
+          previewFlatIndices[idx] = ix + N * (iy + N * iz);
           idx++;
         }
 
@@ -2295,8 +2473,10 @@ async function loadAndRender() {
     plotDiv.style.display = 'block';
 
     function colorscaleFor(fieldName, familyName) {
+      if (fieldName === 'beta_back') return familyName === 'exact' ? 'Turbo' : 'Hot';
       if (fieldName === 'beta_forward') return 'Viridis';
       if (fieldName === 'depol_ratio') return 'Cividis';
+      if (fieldName === 'density') return 'Blues';
       if (fieldName === 'event_count') return 'Blues';
       return familyName === 'exact' ? 'Turbo' : 'Hot';
     }
@@ -2310,14 +2490,29 @@ async function loadAndRender() {
       for (const entry of entries) {
         const fieldName = entry.name;
         const storageName = entry.storage || (familyName + '_' + fieldName);
-        const valuesObj = fieldName === 'density' ? densObj : await readArray(storageName);
         fieldDefs[familyName][fieldName] = {
           label: entry.label || fieldName,
-          values: valuesObj.data,
+          storage: storageName,
+          values: null,
           colorscale: colorscaleFor(fieldName, familyName),
           opacity: fieldName === 'depol_ratio' ? 0.18 : 0.12,
         };
       }
+    }
+
+    async function loadFieldValues(def) {
+      if (def.values) return def.values;
+      loading.style.display = 'block';
+      loading.textContent = '正在加载字段...';
+      const valuesObj = await readArray(def.storage);
+      if (stride === 1) {
+        def.values = valuesObj.data;
+      } else {
+        const sampled = new Float32Array(total);
+        for (let i = 0; i < total; i++) sampled[i] = valuesObj.data[previewFlatIndices[i]];
+        def.values = sampled;
+      }
+      return def.values;
     }
 
     function fieldRange(values, fieldName, familyName) {
@@ -2409,6 +2604,7 @@ async function loadAndRender() {
     async function renderField(familyName, fieldName) {
       if (!Object.prototype.hasOwnProperty.call(fieldDefs, familyName)) return;
       if (!Object.prototype.hasOwnProperty.call(fieldDefs[familyName], fieldName)) return;
+      loading.style.display = 'block';
       currentFamily = familyName;
       currentField = fieldName;
       const nextUrl = new URL(window.location.href);
@@ -2417,6 +2613,8 @@ async function loadAndRender() {
       window.history.replaceState(null, '', nextUrl.toString());
       updateInfo();
       setActiveButton();
+      await loadFieldValues(fieldDefs[currentFamily][currentField]);
+      plotDiv.style.display = 'block';
       await Plotly.react('plot', [makeTrace(familyName, fieldName)], layout, {
         responsive: true,
         displaylogo: false,
@@ -2424,6 +2622,7 @@ async function loadAndRender() {
         scrollZoom: false,
         modeBarButtonsToRemove: ['toImage']
       });
+      loading.style.display = 'none';
     }
 
     if (!EMBED_MODE) {
@@ -2467,8 +2666,6 @@ async function loadAndRender() {
     await renderField(currentFamily, currentField);
     requestAnimationFrame(() => scheduleResize());
     setTimeout(() => scheduleResize(), 120);
-
-    loading.style.display = 'none';
 
   } catch (err) {
     loading.textContent = '渲染失败: ' + err.message;
@@ -2770,9 +2967,10 @@ function run_tests(; verbose::Bool = true)
         fields13 = compute_scatter_fields(fld13, sc13, Dict{String,Any}("r_bottom"=>0.5,"r_top"=>2.0), mc13)
         cfg13   = Dict{String,Any}("shape_type"=>"sphere")
         files13 = render_to_html(fld13, fields13, sc13, cfg13, tmpdir2)
-        chk(length(files13) == 3,                      "生成 3 个 HTML 文件")
+        chk(length(files13) == 4,                      "生成 4 个 HTML 文件")
         chk(isfile(joinpath(tmpdir2,"density.npz")),   "density.npz 存在")
         chk(isfile(joinpath(tmpdir2,"render_main.html")), "render_main.html 存在")
+        chk(isfile(joinpath(tmpdir2,"render_right.html")), "render_right.html 存在")
         # 检查 HTML 包含关键 JS 字符串
         html_content = read(joinpath(tmpdir2,"render_main.html"), String)
         chk(occursin("JSZip",      html_content), "HTML 引用 JSZip")

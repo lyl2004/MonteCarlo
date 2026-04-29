@@ -70,6 +70,11 @@ const DEFAULT_CONFIG = Dict{String, Any}(
     "iitm_nr_scale_on_fallback" => 1.25,
     "iitm_ntheta_scale_on_fallback" => 1.5,
     "field_compute_mode" => "proxy_only",
+    "lidar_enabled" => false,
+    "range_bin_width_m" => 1.0,
+    "range_max_m" => 0.0,
+    "receiver_overlap_min" => 1.0,
+    "receiver_overlap_full_range_m" => 0.0,
     "explode_dist"    => 0.7,
 )
 
@@ -83,6 +88,7 @@ function build_field_metadata(config::Dict, bundle::Dict)
                                                String(get(config, "field_compute_mode", "proxy_only"))),
         "effective_field_compute_mode" => get(bundle, "effective_field_compute_mode", "proxy_only"),
         "primary_field_family" => get(bundle, "primary_field_family", "proxy"),
+        "lidar_observation_available" => haskey(bundle, "lidar_observation"),
     )
     if haskey(bundle, "field_mode_note")
         meta["field_mode_note"] = bundle["field_mode_note"]
@@ -217,6 +223,16 @@ function build_configs(config::Dict)
             Int(get(config, "field_quadrature_polar", 2)),
         "field_quadrature_azimuth" =>
             Int(get(config, "field_quadrature_azimuth", 6)),
+        "collect_lidar_observation" =>
+            Bool(get(config, "lidar_enabled", false)),
+        "range_bin_width_m" =>
+            Float64(get(config, "range_bin_width_m", 1.0)),
+        "range_max_m" =>
+            Float64(get(config, "range_max_m", get(config, "L_size", 20.0))),
+        "receiver_overlap_min" =>
+            Float64(get(config, "receiver_overlap_min", 1.0)),
+        "receiver_overlap_full_range_m" =>
+            Float64(get(config, "receiver_overlap_full_range_m", 0.0)),
     )
 
     return scatter_cfg, mc_cfg, beta_s
@@ -274,13 +290,16 @@ function step3_mc(field::Dict, scatter::Dict, mc_cfg::Dict, log_fn::Function)
         mc_cfg_local["field_axis"] = field["axis"]
         mc_cfg_local["field_xy_centered"] = true
     end
-    mc_cfg_local["collect_voxel_fields"] = requested_mode != "proxy_only"
+    collect_lidar = Bool(get(mc_cfg_local, "collect_lidar_observation", false))
+    mc_cfg_local["collect_voxel_fields"] = requested_mode != "proxy_only" || collect_lidar
     mc_cfg_local["field_forward_half_angle_deg"] = Float64(get(mc_cfg, "field_forward_half_angle_deg", 90.0))
     mc_cfg_local["field_back_half_angle_deg"] = Float64(get(mc_cfg, "field_back_half_angle_deg", 90.0))
     mc_cfg_local["field_quadrature_polar"] = Int(get(mc_cfg, "field_quadrature_polar", 2))
     mc_cfg_local["field_quadrature_azimuth"] = Int(get(mc_cfg, "field_quadrature_azimuth", 6))
     mode_msg = use_3d ? "3D $(density_mode) + z_slab" : "1D profile"
-    field_msg = requested_mode == "proxy_only" ? "proxy only" : "collect exact field"
+    field_msg = requested_mode == "proxy_only" ?
+        (collect_lidar ? "proxy + lidar observation" : "proxy only") :
+        (collect_lidar ? "collect exact field + lidar observation" : "collect exact field")
     log_fn(@sprintf(">> [3/4] Monte Carlo (%d 光子, %s, %s)...",
                     mc_cfg["n_photons"], mode_msg, field_msg))
     t  = time()
