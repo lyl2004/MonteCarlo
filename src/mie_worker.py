@@ -450,6 +450,10 @@ def attach_lidar_observation(data, sim_res):
         "echo_depol",
         "echo_event_count",
         "echo_weight_sum",
+        "echo_weight_sq_sum",
+        "echo_power_variance_est",
+        "echo_power_ci_low",
+        "echo_power_ci_high",
         "echo_relative_error_est",
     ]
     lidar = {name: np.asarray(obs[name], dtype=np.float64) for name in keys if name in obs}
@@ -548,6 +552,14 @@ def save_field_npz(data, output_dir: Path):
             "echo_relative_error_est": np.asarray(lidar["echo_relative_error_est"], dtype=np.float32),
             "receiver_model_json": np.asarray(receiver_model_json),
         })
+        if "echo_weight_sq_sum" in lidar:
+            arrays["echo_weight_sq_sum"] = np.asarray(lidar["echo_weight_sq_sum"], dtype=np.float32)
+        if "echo_power_variance_est" in lidar:
+            arrays["echo_power_variance_est"] = np.asarray(lidar["echo_power_variance_est"], dtype=np.float32)
+        if "echo_power_ci_low" in lidar:
+            arrays["echo_power_ci_low"] = np.asarray(lidar["echo_power_ci_low"], dtype=np.float32)
+        if "echo_power_ci_high" in lidar:
+            arrays["echo_power_ci_high"] = np.asarray(lidar["echo_power_ci_high"], dtype=np.float32)
 
     npz_path = output_dir / "density.npz"
     np.savez_compressed(npz_path, **arrays)

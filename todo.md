@@ -2,7 +2,7 @@
 
 本文件只保留当前仍需继续推进的事项。已经完成的内容已同步到 `Readme.md`。
 
-当前日期状态：`2026-04-27`。
+当前日期状态：`2026-04-29`。
 
 ## 当前完成状态
 
@@ -47,6 +47,9 @@
   - `echo_depol`
   - `echo_event_count`
   - `echo_weight_sum`
+  - `echo_weight_sq_sum`
+  - `echo_power_variance_est`
+  - `echo_power_ci_low / echo_power_ci_high`
   - `echo_relative_error_est`
 - `density.npz` 已保存 lidar observation 数组。
 - Mie 与 Julia 均支持 receiver overlap 简化线性模型：
@@ -56,13 +59,18 @@
   - `src/dataset_sampling.py`
   - `src/dataset_runner.py`
   - 单样本输出 `observation.npz / truth.json / receiver.json / quality.json / run_config.json`
+- Mie dataset runner 已按配置传递 `source_type/source_width_m`，不再硬编码平面源。
+- `quality.json` 已补充 bin 统计、可用 bin 统计、相对误差摘要、方差摘要、source 配置、`requested_seed` 和 `rng_reproducibility`。
+- GUI 已新增同级 `2D 回波诊断` 页；默认显示线性 `P(R)` 和偏振态摘要，Stokes、归一化 Stokes、事件数、相对误差、方差、95% 置信区间、权重矩和 `R²` 修正诊断通过下拉菜单开启。
+- `2D 回波诊断` 页已支持可调质量门限，显示 usable bin 数、可用距离范围、事件数中位数等结果摘要。
+- `2D 回波诊断` 页已新增低频导出菜单，可导出 `exports/echo_observation.csv`、`exports/echo_observation.npz` 和 `exports/result_metadata.json`。
+- 已新增均匀单层介质下的 Mie 解析雷达方程趋势回归，检查当前 `echo_power(R)` 更接近指数双程衰减趋势而非额外 `1/R^2` 衰减。
 
 仍需完成：
 
-- 增加更严格的解析雷达方程趋势回归。
 - 增加大样本统计稳定性验收。
-- Julia 批量 dataset runner 仍需接入 HTTP/server 执行路径。
-- GUI 目前只提供参数入口和运行状态提示，尚未增加 `P(R)` 曲线预览。
+- Julia 批量 dataset runner 已有 HTTP/server 路径，仍需端到端大样本验收。
+- Mie Numba seed 尚未严格控制内核随机流；当前样本元数据只承诺统计复现。
 
 ### T1. 收口 `proxy` 与 `exact` 的正式物理定义
 

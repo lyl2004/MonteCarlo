@@ -885,6 +885,10 @@ mutable struct MCLidarObservation
     echo_depol   :: Vector{Float64}
     echo_event_count :: Vector{Float64}
     echo_weight_sum  :: Vector{Float64}
+    echo_weight_sq_sum :: Vector{Float64}
+    echo_power_variance_est :: Vector{Float64}
+    echo_power_ci_low :: Vector{Float64}
+    echo_power_ci_high :: Vector{Float64}
     echo_relative_error_est :: Vector{Float64}
     receiver_model :: Dict{String,Any}
 end
@@ -914,6 +918,10 @@ function make_lidar_observation(n_bins::Int, range_bin_width_m::Float64,
     range_bins = [(i - 0.5) * range_bin_width_m for i in 1:n_bins]
     return MCLidarObservation(
         range_bins,
+        zeros(Float64, n_bins),
+        zeros(Float64, n_bins),
+        zeros(Float64, n_bins),
+        zeros(Float64, n_bins),
         zeros(Float64, n_bins),
         zeros(Float64, n_bins),
         zeros(Float64, n_bins),
@@ -956,6 +964,7 @@ function merge_lidar_observation!(dst::MCLidarObservation, src::MCLidarObservati
     dst.echo_power .+= src.echo_power
     dst.echo_event_count .+= src.echo_event_count
     dst.echo_weight_sum .+= src.echo_weight_sum
+    dst.echo_weight_sq_sum .+= src.echo_weight_sq_sum
     return dst
 end
 
@@ -967,15 +976,24 @@ function finalize_lidar_observation!(obs::MCLidarObservation, n_photons::Int)
     obs.echo_V .*= inv_n
     obs.echo_power .= obs.echo_I
     obs.echo_weight_sum .*= inv_n
+    obs.echo_power_variance_est .= obs.echo_weight_sq_sum .* inv_n .* inv_n
+    obs.echo_weight_sq_sum .*= inv_n
     @inbounds for i in eachindex(obs.echo_I)
+        std_est = sqrt(obs.echo_power_variance_est[i])
+        obs.echo_power_ci_low[i] = max(obs.echo_I[i] - 1.96 * std_est, 0.0)
+        obs.echo_power_ci_high[i] = obs.echo_I[i] + 1.96 * std_est
         if obs.echo_I[i] > 1e-30
             pol = sqrt(obs.echo_Q[i]^2 + obs.echo_U[i]^2 + obs.echo_V[i]^2) / obs.echo_I[i]
             obs.echo_depol[i] = clamp(1.0 - pol, 0.0, 1.0)
         else
             obs.echo_depol[i] = 0.0
         end
-        obs.echo_relative_error_est[i] = obs.echo_event_count[i] > 0.0 ?
-            1.0 / sqrt(obs.echo_event_count[i]) : 0.0
+        if obs.echo_I[i] > 1e-30
+            obs.echo_relative_error_est[i] = sqrt(obs.echo_power_variance_est[i]) / obs.echo_I[i]
+        else
+            obs.echo_relative_error_est[i] = obs.echo_event_count[i] > 0.0 ?
+                1.0 / sqrt(obs.echo_event_count[i]) : 0.0
+        end
     end
     return obs
 end
@@ -1401,6 +1419,7 @@ function accumulate_detector_contribution!(voxel_map::Dict{Int,MCVoxelSparseEntr
                         lidar_observation.echo_power[bin_idx] += echo_contrib
                         lidar_observation.echo_event_count[bin_idx] += 1.0
                         lidar_observation.echo_weight_sum[bin_idx] += echo_contrib
+                        lidar_observation.echo_weight_sq_sum[bin_idx] += echo_contrib * echo_contrib
                     end
                 end
             end
@@ -2275,6 +2294,10 @@ function save_field_npz(field::Dict, fields::Dict, scatter::Dict, output_dir::St
         arrays["echo_depol"] = Float32.(obs.echo_depol)
         arrays["echo_event_count"] = Float32.(obs.echo_event_count)
         arrays["echo_weight_sum"] = Float32.(obs.echo_weight_sum)
+        arrays["echo_weight_sq_sum"] = Float32.(obs.echo_weight_sq_sum)
+        arrays["echo_power_variance_est"] = Float32.(obs.echo_power_variance_est)
+        arrays["echo_power_ci_low"] = Float32.(obs.echo_power_ci_low)
+        arrays["echo_power_ci_high"] = Float32.(obs.echo_power_ci_high)
         arrays["echo_relative_error_est"] = Float32.(obs.echo_relative_error_est)
         arrays["receiver_model_json_utf8"] = UInt8.(codeunits(String(JSON3.write(obs.receiver_model))))
     end

@@ -320,7 +320,7 @@ def accumulate_detector_contribution_numba(
     x, y, z, mie_angles_deg, mie_tables_all,
     forward_dirs, forward_weights, back_dirs, back_weights,
     path_length, collect_lidar_observation,
-    echo_I, echo_Q, echo_U, echo_V, echo_event_count, echo_weight_sum,
+    echo_I, echo_Q, echo_U, echo_V, echo_event_count, echo_weight_sum, echo_weight_sq_sum,
     range_bin_width_m, range_max_m, overlap_min, overlap_full_range_m
 ):
     event_count[ix, iy, iz] += 1.0
@@ -386,6 +386,7 @@ def accumulate_detector_contribution_numba(
                         echo_V[bin_idx] += echo_contrib * stokes_out[3]
                         echo_event_count[bin_idx] += 1.0
                         echo_weight_sum[bin_idx] += echo_contrib
+                        echo_weight_sq_sum[bin_idx] += echo_contrib * echo_contrib
 
 
 # =============================================================================
@@ -817,7 +818,7 @@ def mc_kernel_advanced_exact(
     forward_I, forward_Q, forward_U, forward_V,
     back_I, back_Q, back_U, back_V, event_count,
     collect_lidar_observation,
-    echo_I, echo_Q, echo_U, echo_V, echo_event_count, echo_weight_sum,
+    echo_I, echo_Q, echo_U, echo_V, echo_event_count, echo_weight_sum, echo_weight_sq_sum,
     range_bin_width_m, range_max_m, overlap_min, overlap_full_range_m
 ):
     if beta_max_global <= 0:
@@ -954,7 +955,7 @@ def mc_kernel_advanced_exact(
                         x, y, z, mie_angles_deg, mie_tables_all,
                         forward_dirs, forward_weights, back_dirs, back_weights,
                         path_length, collect_lidar_observation,
-                        echo_I, echo_Q, echo_U, echo_V, echo_event_count, echo_weight_sum,
+                        echo_I, echo_Q, echo_U, echo_V, echo_event_count, echo_weight_sum, echo_weight_sq_sum,
                         range_bin_width_m, range_max_m, overlap_min, overlap_full_range_m
                     )
 
@@ -1393,6 +1394,7 @@ def run_advanced_simulation(
     echo_V = np.zeros(n_range_bins, dtype=np.float64)
     echo_event_count = np.zeros(n_range_bins, dtype=np.float64)
     echo_weight_sum = np.zeros(n_range_bins, dtype=np.float64)
+    echo_weight_sq_sum = np.zeros(n_range_bins, dtype=np.float64)
     overlap_min = max(0.0, min(1.0, float(receiver_overlap_min)))
     overlap_full = max(0.0, float(receiver_overlap_full_range_m))
 
@@ -1410,7 +1412,7 @@ def run_advanced_simulation(
                 exact_forward_I, exact_forward_Q, exact_forward_U, exact_forward_V,
                 exact_back_I, exact_back_Q, exact_back_U, exact_back_V, exact_event_count,
                 lidar_enabled,
-                echo_I, echo_Q, echo_U, echo_V, echo_event_count, echo_weight_sum,
+                echo_I, echo_Q, echo_U, echo_V, echo_event_count, echo_weight_sum, echo_weight_sq_sum,
                 rbw, rmax, overlap_min, overlap_full
             )
             tc, ac, bc, trc, b_I, b_Q, b_U, b_V = res
@@ -1502,8 +1504,14 @@ def run_advanced_simulation(
             0.0,
             1.0,
         )
+        echo_power_variance = echo_weight_sq_sum * inv_n * inv_n
+        echo_power_std = np.sqrt(echo_power_variance)
+        echo_power_ci_low = np.maximum(echo_I_n - 1.96 * echo_power_std, 0.0)
+        echo_power_ci_high = echo_I_n + 1.96 * echo_power_std
         echo_relative_error = np.zeros_like(echo_I_n)
-        count_mask = echo_event_count > 0.0
+        power_mask = echo_I_n > 1e-30
+        echo_relative_error[power_mask] = echo_power_std[power_mask] / echo_I_n[power_mask]
+        count_mask = (~power_mask) & (echo_event_count > 0.0)
         echo_relative_error[count_mask] = 1.0 / np.sqrt(echo_event_count[count_mask])
         arrays["lidar_observation"] = {
             "range_bins_m": (np.arange(n_range_bins, dtype=np.float64) + 0.5) * rbw,
@@ -1515,6 +1523,10 @@ def run_advanced_simulation(
             "echo_depol": echo_depol,
             "echo_event_count": echo_event_count,
             "echo_weight_sum": echo_weight_sum * inv_n,
+            "echo_weight_sq_sum": echo_weight_sq_sum * inv_n,
+            "echo_power_variance_est": echo_power_variance,
+            "echo_power_ci_low": echo_power_ci_low,
+            "echo_power_ci_high": echo_power_ci_high,
             "echo_relative_error_est": echo_relative_error,
             "receiver_model": {
                 "range_bin_width_m": rbw,

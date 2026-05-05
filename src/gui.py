@@ -2,7 +2,11 @@ import os
 import json
 import sys
 import asyncio
+import ast
+import csv
+import math
 import platform
+import struct
 import subprocess
 import time
 import zipfile
@@ -187,9 +191,13 @@ class AppState:
         self.current_project = None
         self.simulation_backend = 'mie'
         self.config_data = DEFAULT_CONFIG.copy()
+        self.current_preview_page = "3d"
         self.current_view_mode = "main"
         self.current_field_family = "proxy"
         self.current_iitm_field = "beta_back"
+        self.selected_2d_charts = []
+        self.echo_quality_min_events = 1.0
+        self.echo_quality_max_rel_error = 0.5
         self.current_field_catalog = {}
         self.available_field_families = ["proxy"]
         self.requested_field_compute_mode = DEFAULT_CONFIG["field_compute_mode"]
@@ -216,6 +224,42 @@ VIEW_MODE_TO_FILENAMES = {
     "front": ("render_front.html",),
     "top": ("render_top.html",),
     "right": ("render_right.html",),
+}
+
+LIDAR_ECHO_KEYS = [
+    "range_bins_m",
+    "echo_power",
+    "echo_depol",
+    "echo_event_count",
+    "echo_relative_error_est",
+]
+
+LIDAR_DIAGNOSTIC_KEYS = [
+    "range_bins_m",
+    "echo_I",
+    "echo_Q",
+    "echo_U",
+    "echo_V",
+    "echo_power",
+    "echo_depol",
+    "echo_event_count",
+    "echo_weight_sum",
+    "echo_weight_sq_sum",
+    "echo_power_variance_est",
+    "echo_power_ci_low",
+    "echo_power_ci_high",
+    "echo_relative_error_est",
+]
+
+OPTIONAL_2D_CHART_OPTIONS = {
+    "stokes": "Stokes I/Q/U/V",
+    "normalized_stokes": "归一化 Stokes q/u/v",
+    "event_count": "采样事件数",
+    "relative_error": "相对误差",
+    "variance": "回波方差估计",
+    "confidence_interval": "回波 95% 置信区间",
+    "weight_moments": "权重一阶/二阶矩",
+    "range_corrected": "R² 修正诊断",
 }
 
 FIELD_FAMILY_LABELS = {
@@ -724,6 +768,592 @@ def _get_available_view_files() -> dict[str, str]:
     return view_files
 
 
+def _read_npy_header(buffer: bytes) -> tuple[dict, int]:
+    if not buffer.startswith(b"\x93NUMPY"):
+        raise ValueError("invalid npy header")
+    major = buffer[6]
+    if major == 1:
+        header_len = struct.unpack_from("<H", buffer, 8)[0]
+        offset = 10
+    elif major in (2, 3):
+        header_len = struct.unpack_from("<I", buffer, 8)[0]
+        offset = 12
+    else:
+        raise ValueError(f"unsupported npy version: {major}")
+    header = buffer[offset:offset + header_len].decode("latin1").strip()
+    meta = ast.literal_eval(header)
+    return meta, offset + header_len
+
+
+def _read_npy_1d(buffer: bytes) -> list[float]:
+    meta, data_start = _read_npy_header(buffer)
+    shape = tuple(meta.get("shape", ()))
+    if len(shape) != 1:
+        raise ValueError("only 1D npy arrays are supported")
+    count = int(shape[0])
+    descr = str(meta.get("descr", ""))
+    fmt_map = {
+        "<f4": "f", ">f4": "f", "<f8": "d", ">f8": "d",
+        "<i2": "h", ">i2": "h", "<i4": "i", ">i4": "i",
+        "<i8": "q", ">i8": "q", "<u2": "H", ">u2": "H",
+        "<u4": "I", ">u4": "I", "<u8": "Q", ">u8": "Q",
+        "|u1": "B", "|i1": "b",
+    }
+    if descr not in fmt_map:
+        raise ValueError(f"unsupported dtype: {descr}")
+    endian = ">" if descr.startswith(">") else "<"
+    fmt = endian + (fmt_map[descr] * count)
+    values = struct.unpack_from(fmt, buffer, data_start)
+    return [float(v) for v in values]
+
+
+def _read_npy_text(buffer: bytes) -> str:
+    meta, data_start = _read_npy_header(buffer)
+    descr = str(meta.get("descr", ""))
+    raw = buffer[data_start:]
+    if descr.startswith("<U") or descr.startswith(">U"):
+        encoding = "utf-32-le" if descr.startswith("<") else "utf-32-be"
+        return raw.decode(encoding, errors="ignore").rstrip("\x00")
+    if descr.startswith("|S") or descr.startswith("|a"):
+        return raw.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+    raise ValueError(f"unsupported text dtype: {descr}")
+
+
+def _load_receiver_model_from_zip(zf: zipfile.ZipFile, names: set[str]) -> dict:
+    try:
+        if "receiver_model_json_utf8.npy" in names:
+            values = _read_npy_1d(zf.read("receiver_model_json_utf8.npy"))
+            payload = bytes(max(0, min(255, int(v))) for v in values)
+            return json.loads(payload.decode("utf-8"))
+        if "receiver_model_json.npy" in names:
+            payload = _read_npy_text(zf.read("receiver_model_json.npy"))
+            return json.loads(payload)
+    except Exception:
+        return {}
+    return {}
+
+
+def _median(values: list[float]) -> float | None:
+    finite = sorted(v for v in values if math.isfinite(v))
+    if not finite:
+        return None
+    mid = len(finite) // 2
+    if len(finite) % 2:
+        return float(finite[mid])
+    return float(0.5 * (finite[mid - 1] + finite[mid]))
+
+
+def _load_lidar_echo_preview() -> dict:
+    if not state.current_project or state.simulation_backend not in ("mie", "iitm"):
+        return {"available": False, "reason": "no_project"}
+    npz_path = os.path.join(get_output_dir(), state.current_project, "density.npz")
+    if not os.path.exists(npz_path):
+        return {"available": False, "reason": "missing_density_npz"}
+    try:
+        arrays = {}
+        with zipfile.ZipFile(npz_path, "r") as zf:
+            names = set(zf.namelist())
+            for key in LIDAR_ECHO_KEYS:
+                member = f"{key}.npy"
+                if member not in names:
+                    return {"available": False, "reason": "missing_echo_arrays"}
+                arrays[key] = _read_npy_1d(zf.read(member))
+        n = min(len(arrays[key]) for key in LIDAR_ECHO_KEYS)
+        if n <= 0:
+            return {"available": False, "reason": "empty_echo_arrays"}
+        for key in LIDAR_ECHO_KEYS:
+            arrays[key] = arrays[key][:n]
+        counts = arrays["echo_event_count"]
+        rel_err = arrays["echo_relative_error_est"]
+        valid = [i for i, c in enumerate(counts) if c > 0.0]
+        valid_rel = [rel_err[i] for i in valid if math.isfinite(rel_err[i])]
+        return {
+            "available": True,
+            "arrays": arrays,
+            "valid_bin_count": len(valid),
+            "event_count_sum": sum(counts),
+            "max_relative_error": max(valid_rel) if valid_rel else None,
+        }
+    except Exception as exc:
+        return {"available": False, "reason": str(exc)}
+
+
+def _load_lidar_diagnostics() -> dict:
+    if not state.current_project or state.simulation_backend not in ("mie", "iitm"):
+        return {"available": False, "reason": "no_project"}
+    npz_path = os.path.join(get_output_dir(), state.current_project, "density.npz")
+    if not os.path.exists(npz_path):
+        return {"available": False, "reason": "missing_density_npz"}
+    try:
+        arrays = {}
+        with zipfile.ZipFile(npz_path, "r") as zf:
+            names = set(zf.namelist())
+            if "range_bins_m.npy" not in names:
+                return {"available": False, "reason": "missing_range_bins"}
+            for key in LIDAR_DIAGNOSTIC_KEYS:
+                member = f"{key}.npy"
+                if member in names:
+                    arrays[key] = _read_npy_1d(zf.read(member))
+        required = {"range_bins_m", "echo_power", "echo_depol"}
+        if not required.issubset(arrays):
+            return {"available": False, "reason": "missing_default_echo_arrays"}
+        n = min(len(values) for values in arrays.values())
+        if n <= 0:
+            return {"available": False, "reason": "empty_echo_arrays"}
+        for key in list(arrays):
+            arrays[key] = arrays[key][:n]
+        counts = arrays.get("echo_event_count", [0.0] * n)
+        rel_err = arrays.get("echo_relative_error_est", [0.0] * n)
+        power = arrays.get("echo_power", [0.0] * n)
+        ranges = arrays["range_bins_m"]
+        valid = [i for i, c in enumerate(counts) if c > 0.0]
+        valid_rel = [rel_err[i] for i in valid if i < len(rel_err) and math.isfinite(rel_err[i])]
+        min_events = max(0.0, float(state.echo_quality_min_events))
+        max_rel_error = max(0.0, float(state.echo_quality_max_rel_error))
+        usable = [
+            i for i in valid
+            if counts[i] >= min_events
+            and i < len(rel_err)
+            and i < len(power)
+            and power[i] > 0.0
+            and math.isfinite(rel_err[i])
+            and rel_err[i] <= max_rel_error
+        ]
+        usable_ranges = [ranges[i] for i in usable if i < len(ranges)]
+        return {
+            "available": True,
+            "arrays": arrays,
+            "receiver_model": _load_receiver_model_from_zip(zf, names),
+            "valid_bin_count": len(valid),
+            "usable_bin_count": len(usable),
+            "usable_range_min": min(usable_ranges) if usable_ranges else None,
+            "usable_range_max": max(usable_ranges) if usable_ranges else None,
+            "event_count_sum": sum(counts),
+            "median_event_count": _median([counts[i] for i in valid]) if valid else None,
+            "median_relative_error": _median(valid_rel) if valid_rel else None,
+            "max_relative_error": max(valid_rel) if valid_rel else None,
+        }
+    except Exception as exc:
+        return {"available": False, "reason": str(exc)}
+
+
+def _current_density_npz_path() -> str:
+    if not state.current_project:
+        return ""
+    return os.path.join(get_output_dir(), state.current_project, "density.npz")
+
+
+def _current_export_dir() -> str:
+    if not state.current_project:
+        return ""
+    path = os.path.join(get_output_dir(), state.current_project, "exports")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _export_echo_observation_csv() -> None:
+    diag = _load_lidar_diagnostics()
+    if not diag.get("available"):
+        ui.notify(f"无法导出: {diag.get('reason', 'missing data')}", type="negative")
+        return
+    arrays = diag["arrays"]
+    keys = [key for key in LIDAR_DIAGNOSTIC_KEYS if key in arrays]
+    n = min(len(arrays[key]) for key in keys)
+    export_path = os.path.join(_current_export_dir(), "echo_observation.csv")
+    with open(export_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(keys)
+        for i in range(n):
+            writer.writerow([arrays[key][i] for key in keys])
+    ui.notify(f"已导出 CSV: {export_path}", type="positive")
+
+
+def _export_echo_observation_npz() -> None:
+    npz_path = _current_density_npz_path()
+    if not os.path.exists(npz_path):
+        ui.notify("无法导出: density.npz 不存在", type="negative")
+        return
+    export_path = os.path.join(_current_export_dir(), "echo_observation.npz")
+    with zipfile.ZipFile(npz_path, "r") as src, zipfile.ZipFile(
+        export_path, "w", compression=zipfile.ZIP_DEFLATED
+    ) as dst:
+        names = set(src.namelist())
+        written = 0
+        for key in LIDAR_DIAGNOSTIC_KEYS:
+            member = f"{key}.npy"
+            if member in names:
+                dst.writestr(member, src.read(member))
+                written += 1
+        for member in ("receiver_model_json.npy", "receiver_model_json_utf8.npy"):
+            if member in names:
+                dst.writestr(member, src.read(member))
+    if written == 0:
+        ui.notify("无法导出: 未找到 echo_* 数组", type="negative")
+        return
+    ui.notify(f"已导出 NPZ: {export_path}", type="positive")
+
+
+def _export_result_metadata_json() -> None:
+    diag = _load_lidar_diagnostics()
+    if not diag.get("available"):
+        ui.notify(f"无法导出: {diag.get('reason', 'missing data')}", type="negative")
+        return
+    export_path = os.path.join(_current_export_dir(), "result_metadata.json")
+    payload = {
+        "project_name": state.current_project,
+        "backend": state.simulation_backend,
+        "exported_at_unix": time.time(),
+        "output_dir": os.path.join(get_output_dir(), state.current_project),
+        "density_npz": _current_density_npz_path(),
+        "receiver_model": diag.get("receiver_model", {}),
+        "echo_summary": {
+            "valid_bin_count": diag.get("valid_bin_count"),
+            "usable_bin_count": diag.get("usable_bin_count"),
+            "usable_range_min_m": diag.get("usable_range_min"),
+            "usable_range_max_m": diag.get("usable_range_max"),
+            "event_count_sum": diag.get("event_count_sum"),
+            "median_event_count": diag.get("median_event_count"),
+            "median_relative_error": diag.get("median_relative_error"),
+            "max_relative_error": diag.get("max_relative_error"),
+            "quality_thresholds": {
+                "min_event_count": state.echo_quality_min_events,
+                "max_relative_error": state.echo_quality_max_rel_error,
+            },
+        },
+        "requested_field_compute_mode": state.requested_field_compute_mode,
+        "effective_field_compute_mode": state.effective_field_compute_mode,
+        "available_field_families": state.available_field_families,
+        "field_catalog": state.current_field_catalog,
+        "artifacts": state.current_artifacts,
+        "run_config": state.config_data,
+    }
+    with open(export_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    ui.notify(f"已导出元数据: {export_path}", type="positive")
+
+
+def _render_export_menu(disabled: bool = False) -> None:
+    button = ui.button("导出", icon="ios_share").props("dense outline")
+    if disabled:
+        button.disable()
+    with button:
+        with ui.menu():
+            ui.menu_item("导出观测 CSV", on_click=_export_echo_observation_csv)
+            ui.menu_item("导出观测 NPZ", on_click=_export_echo_observation_npz)
+            ui.menu_item("导出元数据 JSON", on_click=_export_result_metadata_json)
+
+
+def _downsample_xy(x_values: list[float], y_values: list[float], max_points: int = 320) -> list[list[float]]:
+    n = min(len(x_values), len(y_values))
+    if n <= 0:
+        return []
+    step = max(1, math.ceil(n / max_points))
+    data = []
+    for idx in range(0, n, step):
+        x = x_values[idx]
+        y = y_values[idx]
+        if math.isfinite(x) and math.isfinite(y):
+            data.append([x, y])
+    return data
+
+
+def _safe_div_series(numer: list[float], denom: list[float]) -> list[float]:
+    n = min(len(numer), len(denom))
+    out = []
+    for i in range(n):
+        d = denom[i]
+        out.append(numer[i] / d if abs(d) > 1e-30 and math.isfinite(d) else 0.0)
+    return out
+
+
+def _series_chart(title: str, x_values: list[float], series: list[dict],
+                  y_name: str = "", y_min=None, y_max=None, log_y: bool = False):
+    chart_series = []
+    for item in series:
+        line_style = {"width": item.get("width", 2)}
+        if item.get("color"):
+            line_style["color"] = item["color"]
+        chart_series.append({
+            "name": item["name"],
+            "type": "line",
+            "showSymbol": False,
+            "data": _downsample_xy(x_values, item["values"], max_points=640),
+            "lineStyle": line_style,
+        })
+    y_axis = {"type": "log" if log_y else "value", "name": y_name, "scale": y_min is None and y_max is None}
+    if y_min is not None:
+        y_axis["min"] = y_min
+    if y_max is not None:
+        y_axis["max"] = y_max
+    with ui.card().classes("w-full p-3 gap-2").style("border-radius:8px;"):
+        ui.label(title).classes("text-sm font-bold text-gray-800")
+        ui.echart({
+            "animation": False,
+            "grid": {"left": 58, "right": 24, "top": 24, "bottom": 42},
+            "tooltip": {"trigger": "axis"},
+            "legend": {"bottom": 0, "textStyle": {"fontSize": 10}},
+            "xAxis": {"type": "value", "name": "R (m)", "nameGap": 20},
+            "yAxis": y_axis,
+            "series": chart_series,
+        }).classes("w-full h-72")
+
+
+def _render_preview_page_tabs() -> None:
+    with ui.row().classes("absolute top-4 left-4 z-50 gap-2"):
+        base = "min-width:96px; font-weight:bold; box-shadow:0 2px 4px rgba(0,0,0,0.2);"
+
+        def style(page_name):
+            active = " background:#1d4ed8; color:white;"
+            normal = " background:rgba(255,255,255,0.94); color:black;"
+            return base + (active if state.current_preview_page == page_name else normal)
+
+        ui.button("3D 场展示", on_click=lambda: _switch_preview_page("3d")) \
+            .style(style("3d")).props("dense size=sm")
+        ui.button("2D 回波诊断", on_click=lambda: _switch_preview_page("2d")) \
+            .style(style("2d")).props("dense size=sm")
+
+
+def _switch_preview_page(page_name: str) -> None:
+    state.current_preview_page = page_name
+    refresh_preview()
+
+
+def _render_2d_diagnostics_page() -> None:
+    _render_preview_page_tabs()
+    diag = _load_lidar_diagnostics()
+    with ui.column().classes("absolute inset-0 pt-16 p-4 gap-3 bg-gray-50 overflow-auto"):
+        with ui.row().classes("w-full items-center justify-between gap-3"):
+            with ui.column().classes("gap-0"):
+                ui.label("2D 回波诊断").classes("text-lg font-bold text-gray-900")
+                if diag.get("available"):
+                    max_rel = diag.get("max_relative_error")
+                    med_rel = diag.get("median_relative_error")
+                    rel_text = "n/a" if max_rel is None else f"{max_rel:.3g}"
+                    med_rel_text = "n/a" if med_rel is None else f"{med_rel:.3g}"
+                    ui.label(
+                        f"valid bins={diag['valid_bin_count']}  usable bins={diag['usable_bin_count']}  "
+                        f"events={diag['event_count_sum']:.0f}  median/max rel.err={med_rel_text}/{rel_text}"
+                    ).classes("text-xs text-gray-600")
+                else:
+                    ui.label("当前项目未输出距离门观测数组").classes("text-xs text-gray-500")
+            with ui.row().classes("items-center gap-2"):
+                selected = ui.select(
+                    OPTIONAL_2D_CHART_OPTIONS,
+                    value=state.selected_2d_charts,
+                    label="添加诊断图",
+                    multiple=True,
+                    on_change=lambda e: _update_2d_chart_selection(e.value),
+                ).classes("w-80")
+                selected.props("use-chips clearable dense")
+                _render_export_menu(disabled=not diag.get("available"))
+
+        if not diag.get("available"):
+            with ui.card().classes("w-full p-6 items-center gap-2").style("border-radius:8px;"):
+                ui.icon("show_chart", size="44px").classes("text-gray-300")
+                ui.label("没有可绘制的二维回波数据").classes("text-gray-500 font-bold")
+                ui.label("请启用 lidar_enabled 后重新运行仿真。").classes("text-xs text-gray-400")
+            return
+
+        arrays = diag["arrays"]
+        ranges = arrays["range_bins_m"]
+        power = arrays["echo_power"]
+        depol = arrays["echo_depol"]
+        with ui.card().classes("w-full p-3 gap-3").style("border-radius:8px;"):
+            with ui.row().classes("w-full items-center gap-4"):
+                usable_min = diag.get("usable_range_min")
+                usable_max = diag.get("usable_range_max")
+                usable_range = "n/a" if usable_min is None else f"{usable_min:.3g} - {usable_max:.3g} m"
+                med_count = diag.get("median_event_count")
+                med_count_text = "n/a" if med_count is None else f"{med_count:.3g}"
+                ui.label(f"可用距离: {usable_range}").classes("text-sm font-bold text-gray-800")
+                ui.label(f"事件数中位数: {med_count_text}").classes("text-xs text-gray-600")
+                ui.label(f"质量门限: count >= {state.echo_quality_min_events:g}, rel.err <= {state.echo_quality_max_rel_error:g}") \
+                    .classes("text-xs text-gray-600")
+            with ui.row().classes("w-full items-center gap-3"):
+                ui.number(
+                    "最小事件数",
+                    value=state.echo_quality_min_events,
+                    min=0,
+                    step=1,
+                    on_change=lambda e: _update_echo_quality_min_events(e.value),
+                ).classes("w-40").props("dense")
+                ui.number(
+                    "最大相对误差",
+                    value=state.echo_quality_max_rel_error,
+                    min=0,
+                    step=0.05,
+                    format="%.3f",
+                    on_change=lambda e: _update_echo_quality_max_rel_error(e.value),
+                ).classes("w-40").props("dense")
+        _series_chart(
+            "回波强度 P(R) - 线性坐标",
+            ranges,
+            [{"name": "P(R)", "values": power, "color": "#2563eb"}],
+            y_name="P(R)",
+        )
+        _series_chart(
+            "偏振态摘要",
+            ranges,
+            [{"name": "depol", "values": depol, "color": "#dc2626"}],
+            y_name="depol",
+            y_min=0,
+            y_max=1,
+        )
+
+        selected_keys = [key for key in state.selected_2d_charts if key in OPTIONAL_2D_CHART_OPTIONS]
+        if "stokes" in selected_keys and all(k in arrays for k in ("echo_I", "echo_Q", "echo_U", "echo_V")):
+            _series_chart(
+                "Stokes 通道",
+                ranges,
+                [
+                    {"name": "I", "values": arrays["echo_I"], "color": "#2563eb"},
+                    {"name": "Q", "values": arrays["echo_Q"], "color": "#dc2626"},
+                    {"name": "U", "values": arrays["echo_U"], "color": "#16a34a"},
+                    {"name": "V", "values": arrays["echo_V"], "color": "#9333ea"},
+                ],
+                y_name="Stokes",
+            )
+        if "normalized_stokes" in selected_keys and all(k in arrays for k in ("echo_I", "echo_Q", "echo_U", "echo_V")):
+            _series_chart(
+                "归一化 Stokes",
+                ranges,
+                [
+                    {"name": "q=Q/I", "values": _safe_div_series(arrays["echo_Q"], arrays["echo_I"]), "color": "#dc2626"},
+                    {"name": "u=U/I", "values": _safe_div_series(arrays["echo_U"], arrays["echo_I"]), "color": "#16a34a"},
+                    {"name": "v=V/I", "values": _safe_div_series(arrays["echo_V"], arrays["echo_I"]), "color": "#9333ea"},
+                ],
+                y_name="q/u/v",
+                y_min=-1,
+                y_max=1,
+            )
+        if "event_count" in selected_keys and "echo_event_count" in arrays:
+            _series_chart(
+                "采样事件数",
+                ranges,
+                [{"name": "event_count", "values": arrays["echo_event_count"], "color": "#0f766e"}],
+                y_name="count",
+            )
+        if "relative_error" in selected_keys and "echo_relative_error_est" in arrays:
+            _series_chart(
+                "相对误差估计",
+                ranges,
+                [{"name": "relative_error", "values": arrays["echo_relative_error_est"], "color": "#ea580c"}],
+                y_name="rel.err",
+            )
+        if "variance" in selected_keys and "echo_power_variance_est" in arrays:
+            _series_chart(
+                "回波方差估计",
+                ranges,
+                [{"name": "variance", "values": arrays["echo_power_variance_est"], "color": "#7c3aed"}],
+                y_name="variance",
+            )
+        if "confidence_interval" in selected_keys and all(k in arrays for k in ("echo_power_ci_low", "echo_power_ci_high")):
+            _series_chart(
+                "回波 95% 置信区间",
+                ranges,
+                [
+                    {"name": "P(R)", "values": power, "color": "#2563eb", "width": 2},
+                    {"name": "CI low", "values": arrays["echo_power_ci_low"], "color": "#93c5fd", "width": 1},
+                    {"name": "CI high", "values": arrays["echo_power_ci_high"], "color": "#1d4ed8", "width": 1},
+                ],
+                y_name="P(R)",
+            )
+        if "weight_moments" in selected_keys:
+            moment_series = []
+            if "echo_weight_sum" in arrays:
+                moment_series.append({"name": "sum_w", "values": arrays["echo_weight_sum"], "color": "#2563eb"})
+            if "echo_weight_sq_sum" in arrays:
+                moment_series.append({"name": "sum_w2", "values": arrays["echo_weight_sq_sum"], "color": "#dc2626"})
+            if moment_series:
+                _series_chart("权重矩", ranges, moment_series, y_name="weight")
+        if "range_corrected" in selected_keys:
+            corrected = [p * r * r for p, r in zip(power, ranges)]
+            _series_chart(
+                "R² 修正诊断",
+                ranges,
+                [{"name": "P(R) R²", "values": corrected, "color": "#0891b2"}],
+                y_name="P(R) R²",
+            )
+
+
+def _update_2d_chart_selection(value) -> None:
+    state.selected_2d_charts = list(value or [])
+    refresh_preview()
+
+
+def _update_echo_quality_min_events(value) -> None:
+    try:
+        state.echo_quality_min_events = max(0.0, float(value or 0.0))
+    except Exception:
+        state.echo_quality_min_events = 1.0
+    refresh_preview()
+
+
+def _update_echo_quality_max_rel_error(value) -> None:
+    try:
+        state.echo_quality_max_rel_error = max(0.0, float(value or 0.0))
+    except Exception:
+        state.echo_quality_max_rel_error = 0.5
+    refresh_preview()
+
+
+def _render_lidar_echo_panel() -> None:
+    echo = _load_lidar_echo_preview()
+    panel_style = (
+        "width:430px; max-width:calc(100vw - 32px); "
+        "background:rgba(255,255,255,0.94); color:#111827; "
+        "border:1px solid rgba(15,23,42,0.18); "
+        "box-shadow:0 10px 24px rgba(15,23,42,0.18); "
+        "border-radius:8px; padding:10px;"
+    )
+    with ui.element("div").classes("absolute bottom-4 left-4 z-50").style(panel_style):
+        with ui.row().classes("w-full items-center justify-between gap-2"):
+            ui.label("Lidar Echo").classes("text-sm font-bold")
+            if echo.get("available"):
+                ui.label(f"valid bins: {echo['valid_bin_count']}").classes("text-xs text-gray-600")
+        if not echo.get("available"):
+            ui.label("当前项目未输出距离门观测").classes("text-xs text-gray-500")
+            return
+
+        arrays = echo["arrays"]
+        range_bins = arrays["range_bins_m"]
+        power_data = _downsample_xy(range_bins, arrays["echo_power"])
+        depol_data = _downsample_xy(range_bins, arrays["echo_depol"])
+        max_rel = echo.get("max_relative_error")
+        rel_text = "n/a" if max_rel is None else f"{max_rel:.3g}"
+        ui.label(
+            f"events={echo['event_count_sum']:.0f}  max rel.err={rel_text}"
+        ).classes("text-xs text-gray-600")
+        ui.echart({
+            "animation": False,
+            "grid": {"left": 48, "right": 48, "top": 16, "bottom": 36},
+            "tooltip": {"trigger": "axis"},
+            "legend": {"bottom": 0, "textStyle": {"fontSize": 10}},
+            "xAxis": {"type": "value", "name": "R (m)", "nameGap": 18},
+            "yAxis": [
+                {"type": "value", "name": "P(R)", "scale": True},
+                {"type": "value", "name": "depol", "min": 0, "max": 1},
+            ],
+            "series": [
+                {
+                    "name": "P(R)",
+                    "type": "line",
+                    "showSymbol": False,
+                    "data": power_data,
+                    "lineStyle": {"width": 2, "color": "#2563eb"},
+                },
+                {
+                    "name": "depol",
+                    "type": "line",
+                    "showSymbol": False,
+                    "yAxisIndex": 1,
+                    "data": depol_data,
+                    "lineStyle": {"width": 2, "color": "#dc2626"},
+                },
+            ],
+        }).classes("w-full h-56")
+
+
 def _build_field_preview_query() -> str:
     max_grid = int(float(state.config_data.get("preview_max_grid", 48) or 48))
     params = {
@@ -802,6 +1432,12 @@ def refresh_preview(view_mode=None):
 
     viewer_container.clear()
     with viewer_container:
+        if state.current_preview_page == "2d":
+            _render_2d_diagnostics_page()
+            return
+
+        _render_preview_page_tabs()
+
         if view_files:
             with ui.row().classes('absolute top-4 right-4 z-50 gap-2'):
                 btn_base = 'min-width:40px; font-weight:bold; box-shadow:0 2px 4px rgba(0,0,0,0.2);'
@@ -818,7 +1454,7 @@ def refresh_preview(view_mode=None):
                         .style(btn_style(mode)).props('dense size=sm')
 
         if state.simulation_backend in ('iitm', 'mie'):
-            with ui.row().classes('absolute top-4 left-4 z-50 gap-2'):
+            with ui.row().classes('absolute top-16 left-4 z-50 gap-2'):
                 family_btn_base = 'min-width:72px; font-weight:bold; box-shadow:0 2px 4px rgba(0,0,0,0.2);'
 
                 def family_btn_style(family_name):
@@ -832,7 +1468,7 @@ def refresh_preview(view_mode=None):
                         on_click=lambda fam=family_name: _switch_preview_family(fam)
                     ).style(family_btn_style(family_name)).props('dense size=sm')
 
-            with ui.row().classes('absolute top-16 left-4 z-50 gap-2'):
+            with ui.row().classes('absolute top-28 left-4 z-50 gap-2'):
                 field_btn_base = 'min-width:66px; font-weight:bold; box-shadow:0 2px 4px rgba(0,0,0,0.2);'
 
                 def field_btn_style(field_name):

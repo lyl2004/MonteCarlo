@@ -26,7 +26,24 @@ OBSERVATION_KEYS = [
     "echo_depol",
     "echo_event_count",
     "echo_weight_sum",
+    "echo_weight_sq_sum",
+    "echo_power_variance_est",
+    "echo_power_ci_low",
+    "echo_power_ci_high",
     "echo_relative_error_est",
+]
+
+RECEIVER_CONFIG_KEYS = [
+    "range_bin_width_m",
+    "range_max_m",
+    "receiver_overlap_min",
+    "receiver_overlap_full_range_m",
+    "field_back_half_angle_deg",
+    "field_forward_half_angle_deg",
+    "field_quadrature_polar",
+    "field_quadrature_azimuth",
+    "source_type",
+    "source_width_m",
 ]
 
 
@@ -54,17 +71,56 @@ def split_name(index: int, n_samples: int, split: dict[str, float] | None) -> st
     return "test"
 
 
-def build_quality(config: dict[str, Any], observation: dict[str, Any], backend_meta: dict[str, Any]) -> dict[str, Any]:
+def rng_reproducibility_label(backend: str) -> str:
+    if backend == "iitm":
+        return "seeded_chunk_stream"
+    if backend == "mie":
+        return "statistical_only"
+    return "unknown"
+
+
+def build_quality(
+    config: dict[str, Any],
+    observation: dict[str, Any],
+    backend_meta: dict[str, Any],
+    backend: str = "",
+) -> dict[str, Any]:
     counts = np.asarray(observation.get("echo_event_count", []), dtype=np.float64)
     rel_err = np.asarray(observation.get("echo_relative_error_est", []), dtype=np.float64)
+    variance = np.asarray(observation.get("echo_power_variance_est", []), dtype=np.float64)
+    power = np.asarray(observation.get("echo_power", []), dtype=np.float64)
     valid = counts > 0.0
+    nonzero_counts = counts[valid]
+    valid_rel_err = rel_err[valid]
+    valid_variance = variance[valid] if variance.shape == counts.shape else np.asarray([], dtype=np.float64)
+    valid_ranges = np.asarray(observation.get("range_bins_m", []), dtype=np.float64)
+    valid_ranges = valid_ranges[valid] if valid_ranges.shape == counts.shape else np.asarray([], dtype=np.float64)
+    low_quality_mask = valid & (rel_err > 0.5) if rel_err.shape == counts.shape else np.zeros_like(valid, dtype=bool)
+    usable_mask = valid & (rel_err <= 0.5) & (power > 0.0) if rel_err.shape == counts.shape and power.shape == counts.shape else np.zeros_like(valid, dtype=bool)
+    requested_seed = int(config.get("seed", 0))
     return {
+        "backend": backend,
         "photons": int(config.get("photons", 0)),
         "echo_event_count_sum": float(np.sum(counts)),
         "valid_bin_count": int(np.sum(valid)),
-        "max_echo_relative_error_est": float(np.max(rel_err[valid])) if np.any(valid) else None,
+        "usable_bin_count": int(np.sum(usable_mask)),
+        "valid_range_min_m": float(np.min(valid_ranges)) if valid_ranges.size else None,
+        "valid_range_max_m": float(np.max(valid_ranges)) if valid_ranges.size else None,
+        "min_nonzero_echo_event_count": float(np.min(nonzero_counts)) if np.any(valid) else None,
+        "median_echo_event_count": float(np.median(nonzero_counts)) if np.any(valid) else None,
+        "median_echo_relative_error_est": float(np.median(valid_rel_err)) if np.any(valid) else None,
+        "max_echo_relative_error_est": float(np.max(valid_rel_err)) if np.any(valid) else None,
+        "low_quality_bin_fraction_relerr_gt_0p5": float(np.sum(low_quality_mask) / max(np.sum(valid), 1)),
+        "median_echo_power_variance_est": float(np.median(valid_variance)) if valid_variance.size else None,
+        "max_echo_power_variance_est": float(np.max(valid_variance)) if valid_variance.size else None,
+        "field_compute_mode": str(config.get("field_compute_mode", "")),
+        "lidar_enabled": bool(config.get("lidar_enabled", False)),
+        "source_type": str(config.get("source_type", "")),
+        "source_width_m": float(config.get("source_width_m", 0.0) or 0.0),
         "code_version": git_hash(),
-        "random_seed": int(config.get("seed", 0)),
+        "requested_seed": requested_seed,
+        "random_seed": requested_seed,
+        "rng_reproducibility": rng_reproducibility_label(backend),
         "backend_meta": backend_meta,
     }
 
@@ -76,20 +132,25 @@ def run_mie_sample(config: dict[str, Any]) -> tuple[dict[str, Any], dict[str, An
     cfg["field_compute_mode"] = str(cfg.get("field_compute_mode", "proxy_only"))
     cfg["grid_dim"] = int(cfg.get("grid_dim", 32))
     cfg["photons"] = int(cfg.get("photons", 10000))
+    cfg["source_type"] = str(cfg.get("source_type", "point")).lower()
+    cfg["source_width_m"] = float(cfg.get("source_width_m", 0.0) or 0.0)
 
     layers = mie_worker.build_mie_layers(cfg)
     temp_dir = ROOT_DIR / "temp" / "datasets" / "_single_sample"
     field = mie_worker.generate_field(cfg, temp_dir, layers)
     freq = 299792458.0 / (float(cfg["wavelength_um"]) * 1e-6) / 1e12
     range_max = float(cfg.get("range_max_m", 0.0))
+    source_width_m = cfg["source_width_m"]
+    if cfg["source_type"] == "planar" and source_width_m <= 0.0:
+        source_width_m = field["L"]
     sim = mie_numba.run_advanced_simulation(
         layers_config=layers["layers_config"],
         frequency_thz=freq,
         photons=cfg["photons"],
         density_grid=field["density_norm"],
         grid_res_m=field["L"] / max(field["dim"] - 1, 1),
-        source_type="planar",
-        source_width_m=field["L"],
+        source_type=cfg["source_type"],
+        source_width_m=source_width_m,
         sigma_ln=cfg["sigma_ln"],
         collect_voxel_fields=True,
         field_forward_half_angle_deg=float(cfg.get("field_forward_half_angle_deg", 90.0)),
@@ -102,6 +163,7 @@ def run_mie_sample(config: dict[str, Any]) -> tuple[dict[str, Any], dict[str, An
         receiver_overlap_min=float(cfg.get("receiver_overlap_min", 1.0)),
         receiver_overlap_full_range_m=float(cfg.get("receiver_overlap_full_range_m", 0.0)),
     )
+    cfg["source_width_m"] = source_width_m
     obs = sim["arrays"]["lidar_observation"]
     return cfg, obs
 
@@ -167,22 +229,50 @@ def export_sample(
     backend_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     sample_dir.mkdir(parents=True, exist_ok=True)
-    obs_arrays = {key: np.asarray(observation[key], dtype=np.float32) for key in OBSERVATION_KEYS}
+    n_bins = len(np.asarray(observation["range_bins_m"]))
+    obs_arrays = {}
+    for key in OBSERVATION_KEYS:
+        if key in observation:
+            obs_arrays[key] = np.asarray(observation[key], dtype=np.float32)
+        else:
+            obs_arrays[key] = np.zeros(n_bins, dtype=np.float32)
     np.savez_compressed(sample_dir / "observation.npz", **obs_arrays)
 
     receiver = dict(observation.get("receiver_model", {}))
+    for key in RECEIVER_CONFIG_KEYS:
+        if key in config and key not in receiver:
+            receiver[key] = config.get(key)
+    if "overlap_min" not in receiver and "receiver_overlap_min" in config:
+        receiver["overlap_min"] = config.get("receiver_overlap_min")
+    if "overlap_full_range_m" not in receiver and "receiver_overlap_full_range_m" in config:
+        receiver["overlap_full_range_m"] = config.get("receiver_overlap_full_range_m")
     truth = {
         "backend": backend,
         "medium": {
             key: config.get(key)
-            for key in ["visibility_km", "r_bottom", "r_top", "sigma_ln", "m_real", "m_imag", "wavelength_um"]
+            for key in [
+                "visibility_km",
+                "r_bottom",
+                "r_top",
+                "sigma_ln",
+                "m_real",
+                "m_imag",
+                "wavelength_um",
+                "shape_type",
+                "axis_ratio",
+                "r_eff",
+            ]
         },
         "field": {
             key: config.get(key)
             for key in ["L_size", "grid_dim", "cloud_center_z", "cloud_thickness", "turbulence_scale"]
         },
+        "source": {
+            key: config.get(key)
+            for key in ["source_type", "source_width_m"]
+        },
     }
-    quality = build_quality(config, observation, backend_meta or {})
+    quality = build_quality(config, observation, backend_meta or {}, backend)
     files = {
         "truth.json": truth,
         "receiver.json": receiver,

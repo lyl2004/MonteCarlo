@@ -53,6 +53,10 @@ obs = mc.lidar_observation
 @assert length(obs.echo_I) == 8
 @assert all(isfinite, obs.echo_I)
 @assert all(x -> x >= 0.0, obs.echo_power)
+@assert all(x -> x >= 0.0, obs.echo_weight_sq_sum)
+@assert all(x -> x >= 0.0, obs.echo_power_variance_est)
+@assert all(x -> x >= 0.0, obs.echo_power_ci_low)
+@assert all(obs.echo_power_ci_high .>= obs.echo_power_ci_low)
 @assert all(x -> 0.0 <= x <= 1.0, obs.echo_depol)
 @assert obs.receiver_model["receiver_mode"] == "backscatter"
 
@@ -68,6 +72,10 @@ try
     @assert haskey(data, "range_bins_m")
     @assert haskey(data, "echo_I")
     @assert haskey(data, "echo_depol")
+    @assert haskey(data, "echo_weight_sq_sum")
+    @assert haskey(data, "echo_power_variance_est")
+    @assert haskey(data, "echo_power_ci_low")
+    @assert haskey(data, "echo_power_ci_high")
     @assert haskey(data, "receiver_model_json_utf8")
 finally
     rm(tmpdir; recursive=true, force=true)

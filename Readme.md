@@ -30,6 +30,9 @@
   - `primary_field_family`
 - GUI 会从后端返回的 `field_catalog` 或现有 `density.npz` 中恢复 `proxy/exact` 字段目录；切换项目后仍可选择精确场。
 - 字段切换优先通过 iframe `postMessage` 完成，避免频繁销毁 Plotly/WebGL 上下文；切换视图文件时才重新加载 iframe。
+- GUI 预览区提供同级页面切换：
+  - `3D 场展示`：查看 `proxy/exact` 三维场。
+  - `2D 回波诊断`：查看距离门二维曲线；默认显示线性 `P(R)` 和偏振态摘要，其余 Stokes、误差、方差、权重矩等诊断图通过下拉菜单开启。
 
 ## 内置仿真情景
 
@@ -443,6 +446,10 @@ render_right.html
 | `echo_depol` | 距离门退偏比 |
 | `echo_event_count` | 每个距离门采样事件数 |
 | `echo_weight_sum` | 每个距离门权重和 |
+| `echo_weight_sq_sum` | 每个距离门权重二阶矩 |
+| `echo_power_variance_est` | 基于权重二阶矩的回波方差估计 |
+| `echo_power_ci_low` | 回波强度 95% 置信区间下界 |
+| `echo_power_ci_high` | 回波强度 95% 置信区间上界 |
 | `echo_relative_error_est` | 距离门相对误差估计 |
 | `beta_back` | primary family legacy alias |
 | `beta_forward` | primary family legacy alias |
@@ -469,6 +476,14 @@ render_right.html
    - `view=main|front|top|right`
 
 字段切换不重新创建 iframe，优先复用当前 Plotly/WebGL 上下文；只有视图文件变化时才重新加载对应 HTML。GUI 在切换项目后会从 worker 返回值或已存在的 `density.npz` 恢复 `proxy/exact` 字段目录，避免 exact 按钮丢失。
+
+二维回波诊断页直接读取 `density.npz` 中的 `echo_*` 数组，不依赖三维 HTML。默认只绘制线性回波强度和偏振态摘要；可选图包括 Stokes 分量、归一化 Stokes、事件数、相对误差、方差估计、95% 置信区间、权重矩和 `R²` 修正诊断。页面提供可调质量门限，用于计算可用 bin 数和可用距离范围。
+
+二维回波诊断页提供低频使用的导出菜单，输出到当前项目的 `exports/` 子目录：
+
+- `echo_observation.csv`：距离门观测表，便于 Excel、Origin、MATLAB 或论文绘图。
+- `echo_observation.npz`：仅包含 `echo_*` 与 receiver model 的轻量数组包。
+- `result_metadata.json`：项目、后端、配置、receiver model、field catalog 和 echo 质量摘要。
 
 渲染成本随 `grid_dim^3 * 字段数` 增长。`grid_dim=120` 时，单个 Float32 三维场约 `6.9 MB`，多个 proxy/exact 字段会显著增加浏览器内存和 NPZ 大小。
 
@@ -591,6 +606,247 @@ sqrt(p * (1 - p) / N)
 ```
 
 示例：如果 `R_back ≈ 0.003` 且 `N = 80000`，标准误差约为 `0.000193`，相对误差约 `6%`。exact voxel 场的有效样本不是总 photon 数，而是每个 voxel 的 `event_count`。
+
+## 算法成熟度与科研化路线
+
+当前代码已经具备科研项目雏形所需的主链路：
+
+```text
+散射物理 -> Monte Carlo 传播 -> detector-conditioned response -> 距离门 echo -> 样本协议
+```
+
+但不能认为“算法层已经充分完善，只需要添加真实仪器参数”。更准确的判断是：
+
+- 主链路已成型，工程协议初步稳定。
+- `proxy/exact/echo` 分层方向正确。
+- 两套后端都已能输出距离门观测量。
+- 但定量物理闭合、接收器几何、归一化、误差估计和验证体系仍需继续补齐。
+
+如果在这些问题未收口前直接填入真实仪器参数，输出只能称为“带真实参数名义的数值仿真”，不能自然等同于科研级真实激光雷达观测。
+
+### 当前较成熟的部分
+
+- Mie 与 IITM/T-Matrix 双后端分工清晰：
+  - Mie 用于球形粒子快速计算。
+  - IITM/T-Matrix 用于非球形粒子分析。
+- Monte Carlo 传播主链路已经成立：
+  - 光子传播。
+  - 散射/吸收/透射。
+  - density-aware 三维介质。
+  - z-slab majorant 加速。
+- `proxy/exact/echo` 三层输出区分了：
+  - 快速可视化场。
+  - 事件响应场。
+  - 距离门观测量。
+- 数据集样本协议已经初步成型：
+  - `observation.npz`
+  - `truth.json`
+  - `receiver.json`
+  - `quality.json`
+  - `run_config.json`
+
+### 尚未充分完善的算法层问题
+
+1. 接收器模型仍不等价于严格真实 lidar。
+
+   当前 `echo_power` 更接近固定 detector cone 下的条件响应：
+
+   ```text
+   receiver_model = fixed_cone_response
+   ```
+
+   真实 lidar 通常需要显式建模：
+
+   ```text
+   有限发射束 + 有限接收孔径 + 有限 FOV + overlap + 1/R^2 几何接收 + 系统效率
+   ```
+
+2. 输出量纲和归一化尚未完全闭合。
+
+   当前 `echo_power` 应解释为相对响应或归一化响应，而不是已经绝对校准的接收功率。后续需要明确区分：
+
+   ```text
+   echo_power_relative
+   echo_power_range_corrected
+   echo_power_watt
+   echo_photon_count
+   ```
+
+3. Monte Carlo 误差估计仍偏简化。
+
+   当前主要使用：
+
+   ```text
+   echo_relative_error_est ≈ 1 / sqrt(echo_event_count)
+   ```
+
+   对带权 Monte Carlo，更严格的 bin 级误差应保存权重二阶矩：
+
+   ```text
+   sum_w
+   sum_w2
+   variance_est
+   relative_error = sqrt(variance_est) / mean
+   ```
+
+4. 物理回归测试还不足。
+
+   现有测试更多验证字段、shape、范围和合约；科研级验证需要证明代码在简单极限下退化为已知解析解或标准公式。
+
+5. 偏振退偏比定义需要与目标应用对齐。
+
+   当前 `echo_depol` 使用：
+
+   ```text
+   1 - sqrt(Q^2 + U^2 + V^2) / I
+   ```
+
+   这更像偏振度损失，不一定等同于传统偏振 lidar 常用的：
+
+   ```text
+   linear_depol_ratio = P_perpendicular / P_parallel
+   ```
+
+### 无新增仪器信息时仍可推进的工作
+
+即使暂时没有真实设备参数，也可以继续把项目推向科研级可靠性：
+
+1. 正式命名当前接收器模型。
+
+   在配置和元数据中明确：
+
+   ```text
+   receiver_model = fixed_cone_response
+   echo_power = detector-conditioned relative range-bin response
+   ```
+
+   目的：避免把当前相对响应误用为绝对接收功率。
+
+2. 增加解析雷达方程趋势回归。
+
+   构造均匀、低光学厚度、单散射主导场景，检查当前 `echo_power(R)` 更接近：
+
+   ```text
+   beta * exp(-2 * beta_ext * R)
+   ```
+
+   还是：
+
+   ```text
+   beta * exp(-2 * beta_ext * R) / R^2
+   ```
+
+   目的：定位当前估计器是否缺少真实接收几何的 `1/R^2` 因子。
+
+3. 增加带权误差统计。
+
+   在每个 range bin 增加：
+
+   ```text
+   echo_weight_sq_sum
+   echo_power_variance_est
+   echo_relative_error_est
+   ```
+
+   当前实现保留既有 `echo_relative_error_est` 字段名，并优先使用权重二阶矩估计相对误差；目的：让样本质量筛选不只依赖事件数。
+
+4. 增加 photon 数收敛测试。
+
+   固定同一场景，分别运行：
+
+   ```text
+   N, 4N, 16N
+   ```
+
+   检查 `echo_power` 与 `echo_depol` 是否收敛，误差是否近似按 `1/sqrt(N)` 下降。
+
+5. 增加跨后端一致性测试。
+
+   在球形极限下比较：
+
+   ```text
+   Mie sphere vs Julia/IITM sphere
+   ```
+
+   优先比较：
+
+   - `sigma_ext`
+   - `sigma_sca`
+   - `omega0`
+   - `g`
+   - `M11/M12`
+   - `R_back`
+   - `echo_power` 趋势
+
+6. 收口字段单位和适用边界。
+
+   为每个核心字段写明：
+
+   - 来源。
+   - 单位或无量纲定义。
+   - 是否可用于训练。
+   - 是否可与真实 lidar 直接对比。
+   - 需要同时报告哪些参数。
+
+7. 增加传统偏振 lidar 通道。
+
+   在保留当前 `echo_depol` 的同时，后续可增加：
+
+   ```text
+   echo_parallel
+   echo_perpendicular
+   linear_depol_ratio
+   ```
+
+   目的：便于与文献和真实偏振 lidar 数据对齐。
+
+8. 增加样本质量分级。
+
+   可由以下指标自动给出 `high/medium/low`：
+
+   - `valid_bin_count`
+   - `min_nonzero_echo_event_count`
+   - `median_echo_relative_error_est`
+   - `max_echo_relative_error_est`
+   - 能量守恒检查。
+   - NaN/Inf 检查。
+
+9. 建立固定 benchmark 场景集。
+
+   建议逐步增加：
+
+   - `benchmark_rayleigh_low_tau`
+   - `benchmark_mie_sphere_single_layer`
+   - `benchmark_uniform_medium_lidar`
+   - `benchmark_overlap_linear`
+   - `benchmark_dense_multiple_scattering`
+   - `benchmark_iitm_sphere_vs_mie`
+
+10. 整理科研说明书式文档结构。
+
+    后续 README 应逐步补齐：
+
+    - Model assumptions
+    - Governing equations
+    - Monte Carlo estimator
+    - Receiver model
+    - Output definitions
+    - Validation cases
+    - Known limitations
+    - Reproducibility
+
+### 近期优先级建议
+
+在不新增真实仪器信息的前提下，建议优先级为：
+
+1. 将当前模型正式标记为 `fixed_cone_response`。
+2. 增加解析 `P(R)` 趋势回归。
+3. 增加 `echo_weight_sq_sum` 与带权误差估计。
+4. 增加 photon 数收敛测试。
+5. 增加 `Mie sphere` 与 `IITM sphere` 对比。
+6. 明确或扩展传统偏振通道定义。
+7. 增加样本质量分级。
+8. 整理字段单位、模型假设和验证边界。
 
 ## 当前验证数据
 
@@ -792,7 +1048,11 @@ pixi run -e gui python -m py_compile src/gui.py src/iitm_http_worker.py src/iitm
   - `echo_depol`
   - `echo_event_count`
   - `echo_weight_sum`
+  - `echo_weight_sq_sum`
+  - `echo_power_variance_est`
+  - `echo_power_ci_low / echo_power_ci_high`
   - `echo_relative_error_est`
+- `echo_relative_error_est` 当前优先由权重二阶矩估计，避免只按事件数粗略估计；`echo_power_ci_low/high` 为基于同一方差估计的 95% 置信区间。
 - 当前 `echo_*` 来源为 accepted scattering event 的 detector-cone backscatter response：
   - 距离门映射使用 `R = (path_length_to_event + escape_path_to_receiver) / 2`。
   - receiver overlap 当前使用简化线性模型。
@@ -802,6 +1062,7 @@ pixi run -e gui python -m py_compile src/gui.py src/iitm_http_worker.py src/iitm
   - `receiver.json`
   - `quality.json`
   - `run_config.json`
+- 已新增均匀单层介质下的 Mie 趋势回归，用于检查当前 `echo_power(R)` 的指数双程衰减行为。
 
 **验收标准**：
 
@@ -825,6 +1086,28 @@ pixi run -e gui python -m py_compile src/gui.py src/iitm_http_worker.py src/iitm
 
 - 任意样本可通过元数据完整复算。
 - 不同后端（Mie / IITM）可输出同构观测字段。
+
+**当前实现状态（2026-04-29 迭代补充）**：
+
+- Mie dataset runner 已按配置传递 `source_type/source_width_m`，不再硬编码平面源。
+- 单样本协议继续输出：
+  - `observation.npz`
+  - `truth.json`
+  - `receiver.json`
+  - `quality.json`
+  - `run_config.json`
+- `receiver.json` 补充记录距离门、overlap、detector cone quadrature 和 source 配置。
+- `quality.json` 补充记录：
+  - `valid_bin_count`
+  - `echo_event_count_sum`
+  - `min_nonzero_echo_event_count`
+  - `median_echo_relative_error_est`
+  - `max_echo_relative_error_est`
+  - `field_compute_mode`
+  - `source_type/source_width_m`
+  - `requested_seed`
+  - `rng_reproducibility`
+- 当前 Mie 随机数语义标记为 `statistical_only`：配置和 seed 可追踪，但 Numba 内核尚未实现严格逐次复现随机流。
 
 ---
 
