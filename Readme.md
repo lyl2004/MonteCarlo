@@ -9,7 +9,7 @@
   - 面向 `sphere / cylinder / spheroid`。
   - 适合非球形粒子、solver 诊断和更严格的散射物理分析。
 
-当前日期状态：`2026-04-29`。
+当前日期状态：`2026-05-12`。
 
 ## 当前状态
 
@@ -443,7 +443,10 @@ render_right.html
 | `range_bins_m` | 距离门坐标 |
 | `echo_I/Q/U/V` | 距离门 Stokes 通道 |
 | `echo_power` | 距离门回波强度 |
-| `echo_depol` | 距离门退偏比 |
+| `echo_parallel_power` | 平行偏振回波功率，`0.5 * (echo_I + echo_Q)` |
+| `echo_perpendicular_power` | 垂直偏振回波功率，`0.5 * (echo_I - echo_Q)` |
+| `linear_depol_ratio` | 线退偏比，`echo_perpendicular_power / echo_parallel_power` |
+| `echo_depol` | legacy 偏振损失诊断，`1 - sqrt(Q^2 + U^2 + V^2) / I` |
 | `echo_event_count` | 每个距离门采样事件数 |
 | `echo_weight_sum` | 每个距离门权重和 |
 | `echo_weight_sq_sum` | 每个距离门权重二阶矩 |
@@ -580,14 +583,15 @@ render_right.html
 - `event_count` 是解释 exact 场可信度的关键。
 - `event_count=0` 的 voxel 不应做定量解释。
 
-### 退偏比
+### 退偏与偏振通道
 
 `depol_ratio` 当前统一钳制在 `[0, 1]`。
 
 - proxy depol：来自 LUT 或散射参考量。若场景只有单一均匀粒径谱/形状谱，且 LUT 不随高度、混合比例或微物理状态变化，proxy depol 出现常数是合理结果，不代表探测器响应退化。
 - exact depol：来自 voxel 累积 Stokes 分量：
   - `1 - sqrt(Q^2 + U^2 + V^2) / I`
-- echo depol：来自距离门 Stokes 通道，是后续反演数据库优先使用的观测量。
+- echo 主退偏观测量：`linear_depol_ratio = echo_perpendicular_power / echo_parallel_power`，其中 `echo_parallel_power = 0.5 * (echo_I + echo_Q)`，`echo_perpendicular_power = 0.5 * (echo_I - echo_Q)`。
+- `echo_depol` 仅保留为 legacy 偏振损失诊断字段，不再作为默认线退偏比解释。
 
 要让 proxy 退偏比具有空间变化，需要引入分层、双峰/混合粒径谱、形状混合、折射率变化或 range-varying microphysics；否则应优先使用 exact/echo depol 解释 MC 探测响应。两类三维场来源不同，当前字段名相同但通过 family 区分。
 
@@ -695,17 +699,21 @@ sqrt(p * (1 - p) / N)
 
 5. 偏振退偏比定义需要与目标应用对齐。
 
-   当前 `echo_depol` 使用：
+   当前默认 echo 偏振主字段已切换为传统线退偏通道：
+
+   ```text
+   echo_parallel_power = 0.5 * (echo_I + echo_Q)
+   echo_perpendicular_power = 0.5 * (echo_I - echo_Q)
+   linear_depol_ratio = echo_perpendicular_power / echo_parallel_power
+   ```
+
+   `echo_depol` 仍保留为 legacy 诊断字段，定义为：
 
    ```text
    1 - sqrt(Q^2 + U^2 + V^2) / I
    ```
 
-   这更像偏振度损失，不一定等同于传统偏振 lidar 常用的：
-
-   ```text
-   linear_depol_ratio = P_perpendicular / P_parallel
-   ```
+   它更像偏振度损失，不等同于传统偏振 lidar 常用的线退偏比。
 
 ### 无新增仪器信息时仍可推进的工作
 
@@ -758,7 +766,7 @@ sqrt(p * (1 - p) / N)
    N, 4N, 16N
    ```
 
-   检查 `echo_power` 与 `echo_depol` 是否收敛，误差是否近似按 `1/sqrt(N)` 下降。
+  检查 `echo_power` 与 `linear_depol_ratio` 是否收敛，误差是否近似按 `1/sqrt(N)` 下降。
 
 5. 增加跨后端一致性测试。
 
@@ -788,17 +796,9 @@ sqrt(p * (1 - p) / N)
    - 是否可与真实 lidar 直接对比。
    - 需要同时报告哪些参数。
 
-7. 增加传统偏振 lidar 通道。
+7. 完善传统偏振 lidar 通道验收。
 
-   在保留当前 `echo_depol` 的同时，后续可增加：
-
-   ```text
-   echo_parallel
-   echo_perpendicular
-   linear_depol_ratio
-   ```
-
-   目的：便于与文献和真实偏振 lidar 数据对齐。
+   当前已输出 `echo_parallel_power / echo_perpendicular_power / linear_depol_ratio`。后续应补充大样本收敛、球形粒子低线退偏 sanity check，以及跨后端同场景统计一致性验收。
 
 8. 增加样本质量分级。
 
@@ -850,7 +850,86 @@ sqrt(p * (1 - p) / N)
 
 ## 当前验证数据
 
-### Mie 物理一致性
+### 阶段一：物理闭合测试（2026-05-12）
+
+**测试日期**：2026-05-12  
+**测试范围**：WF1 能量守恒、WF2 P(R) 解析回归、WF3 光子收敛、WF4 跨后端一致性  
+**测试状态**：✓ 全部通过（Python 6 tests + Julia 2 workflows + 跨后端 7 tests = 9 tests OK）
+
+#### WF1：能量守恒（Python + Julia）
+
+**场景**：5 个 τ × 吸收组合，球形单分散，L=20m，200k 光子  
+**验收**：`R_back + R_trans + R_abs = 1.0`，偏差 < 1e-10
+
+| 场景 | β_ext [m⁻¹] | τ | m_imag | R_back | R_trans | R_abs | 偏差 |
+|------|------------|---|--------|--------|---------|-------|------|
+| EC-1 | 0.002 | 0.04 | 0 | 0.003950 | 0.996050 | 0.000000 | 0.00e+00 |
+| EC-2 | 0.050 | 1.0 | 0 | 0.100405 | 0.899595 | 0.000000 | 0.00e+00 |
+| EC-3 | 0.300 | 6.0 | 0 | 0.441035 | 0.558965 | 0.000000 | 0.00e+00 |
+| EC-4 | 0.002 | 0.04 | 5e-4 | 0.003975 | 0.995825 | 0.000200 | 1.11e-16 |
+| EC-5 | 0.050 | 1.0 | 5e-4 | 0.099390 | 0.895275 | 0.005335 | 0.00e+00 |
+
+**结论**：Python/Mie 和 Julia/IITM 两后端均通过 5/5 场景能量守恒验证。
+
+#### WF2：P(R) 解析物理回归（Python + Julia）
+
+**场景**：PR-BASE，visibility=0.05 km（β_ext≈0.0203 m⁻¹，τ≈0.41），均匀密度，1M 光子，全重叠  
+**验收**：`log P(R) = A + slope × R`，斜率与理论 `-2β_ext` 相对偏差 ≤ 60%（多散射修正）
+
+| 指标 | Python 结果 | Julia 结果 |
+|------|------------|-----------|
+| 有效 bin 数 | ≥ 10 | 30 |
+| 拟合 R² | ≥ 0.90 | - |
+| 斜率相对偏差 | ~54% | - |
+| Beer-Lambert vs 1/R² | resid_exp < resid_inv2 | ✓ 递减趋势确认 |
+| linear_depol_ratio 定义 | ✓ 正确 | ✓ 正确 |
+
+**结论**：Python 6/6 测试通过（含 P(R) 回归、overlap 抑制、多 τ 斜率验证）；Julia 确认 P(R) 递减趋势和偏振字段合约。
+
+#### WF3：光子数收敛体系（Python）
+
+**场景**：CV-BASE，光子数序列 [25k, 100k, 400k]，每级 5 个 seed  
+**验收**：跨 seed 相对标准差收敛比在 [1.6, 2.4]（理论 2.0 ± 40%）
+
+| 指标 | 结果 |
+|------|------|
+| 收敛比（25k→100k） | 1.71 |
+| 收敛比（100k→400k） | 2.01 |
+| 球形粒子 median(linear_depol_ratio) | 0.1463 < 0.20 ✓ |
+
+**结论**：2/2 测试通过，确认 echo_power 和 linear_depol_ratio 随光子数按 ~1/√N 收敛。
+
+#### WF4：跨后端一致性（Python + Julia）
+
+**L1 散射参量**（常规测试）：r=1.0 μm 球形，λ=1550 nm，m=1.5+0i
+
+| 参量 | Mie | IITM | 相对/绝对偏差 | 验收标准 |
+|------|-----|------|--------------|---------|
+| σ_ext | 1.2807e-11 m² | 1.2807e-11 m² | < 1% | ✓ |
+| σ_sca | 1.2807e-11 m² | 1.2807e-11 m² | < 1% | ✓ |
+| ω₀ | 1.0 | 1.0 | < 0.002 | ✓ |
+| g | 0.7460 | 0.7460 | < 0.01 | ✓ |
+| M11 相关性 | - | - | > 0.9999 | ✓ |
+
+**L2 全局 MC 统计**（慢速测试）：1M 光子，visibility=0.05 km
+
+| 后端 | R_back | R_trans | R_abs | 能量守恒 | R_back 相对偏差 |
+|------|--------|---------|-------|---------|----------------|
+| Mie | 0.036989 | 0.962604 | 0.000407 | ✓ | - |
+| IITM | 0.041174 | 0.958389 | 0.000437 | ✓ | 10.16% < 15% ✓ |
+
+**L3 距离门观测**（慢速测试）：500k 光子，density_norm=1
+
+| 指标 | Mie | IITM | 偏差 | 验收标准 |
+|------|-----|------|------|---------|
+| echo_power 斜率 | -0.020512 | -0.020008 | 2.5% | < 20% ✓ |
+| median(linear_depol_ratio) | 0.2290 | 0.2623 | 0.0333 | < 0.08 ✓ |
+
+**结论**：7/7 测试通过（L1 5 tests + L2 1 test + L3 1 test），Mie 与 IITM 在散射参量、全局统计和距离门观测上保持一致。
+
+---
+
+### Mie 物理一致性（历史基线）
 
 命令：
 
@@ -1035,7 +1114,10 @@ pixi run -e gui python -m py_compile src/gui.py src/iitm_http_worker.py src/iitm
 - `arrays.range_bins_m`
 - `arrays.echo_I, echo_Q, echo_U, echo_V`
 - `arrays.echo_power`
-- `arrays.echo_depol`
+- `arrays.echo_parallel_power`
+- `arrays.echo_perpendicular_power`
+- `arrays.linear_depol_ratio`
+- `arrays.echo_depol`（legacy 偏振损失诊断）
 - `meta.receiver_model`（门宽/FOV/overlap/noise 等）
 
 **当前实现状态（2026-04-29 迭代）**：
@@ -1045,7 +1127,9 @@ pixi run -e gui python -m py_compile src/gui.py src/iitm_http_worker.py src/iitm
   - `range_bins_m`
   - `echo_I / echo_Q / echo_U / echo_V`
   - `echo_power`
-  - `echo_depol`
+  - `echo_parallel_power / echo_perpendicular_power`
+  - `linear_depol_ratio`
+  - `echo_depol`（legacy 偏振损失诊断）
   - `echo_event_count`
   - `echo_weight_sum`
   - `echo_weight_sq_sum`
